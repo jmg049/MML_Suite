@@ -136,7 +136,11 @@ class UttFusionModel(Module, MultimodalMonitoringMixin, MultimodalModelProtocol)
         a_embd = self.netA(A) if not is_embd_A and A is not None else A
         v_embd = self.netV(V) if not is_embd_V and V is not None else V
         t_embd = self.netT(T) if not is_embd_T and T is not None else T
-
+        #
+        # console.print(f"A Embd Shape: {a_embd.shape}")
+        # console.print(f"V Embd Shape: {v_embd.shape}")
+        # console.print("T Embd Shape: {t_embd.shape}")
+        #
         fused = torch.cat([embd for embd in [a_embd, v_embd, t_embd] if embd is not None], dim=-1)
         logits = self.netC(fused)
         return logits
@@ -254,41 +258,50 @@ class UttFusionModel(Module, MultimodalMonitoringMixin, MultimodalModelProtocol)
         if return_test_info:
             return {
                 "loss": loss.item(),
-                "predictions": all_predictions,
-                "labels": all_labels,
-                "miss_types": all_miss_types,
+                "predictions": safe_detach(predictions),
+                "labels": labels,
+                "miss_type": miss_types,
+                "targets": labels,
+                "logits": safe_detach(logits),
             }
-        return {"loss": loss.item()}
+        return {
+            "loss": loss.item(),
+            "predictions": safe_detach(predictions),
+            "labels": labels,
+            "miss_type": miss_types,
+            "targets": labels,
+            "logits": safe_detach(logits),
+        }
 
-    def get_embeddings(self, dataloader: DataLoader, device: torch.device) -> Dict[Modality, np.ndarray]:
-        """
-        Get embeddings for all samples in a dataloader.
+    # def get_embeddings(self, dataloader: DataLoader, device: torch.device) -> Dict[Modality, np.ndarray]:
+    #     """
+    #     Get embeddings for all samples in a dataloader.
 
-        Args:
-            dataloader (DataLoader): DataLoader for the dataset.
-            device (torch.device): Computation device.
+    #     Args:
+    #         dataloader (DataLoader): DataLoader for the dataset.
+    #         device (torch.device): Computation device.
 
-        Returns:
-            Dict[Modality, np.ndarray]: Dictionary of embeddings for each modality.
-        """
-        self.eval()
-        embeddings = defaultdict(list)
-        with torch.no_grad():
-            for batch in dataloader:
-                A, V, T = (
-                    batch[Modality.AUDIO].to(device).float(),
-                    batch[Modality.VIDEO].to(device).float(),
-                    batch[Modality.TEXT].to(device).float(),
-                )
-                a_embd = self.netA(A)
-                v_embd = self.netV(V)
-                t_embd = self.netT(T)
+    #     Returns:
+    #         Dict[Modality, np.ndarray]: Dictionary of embeddings for each modality.
+    #     """
+    #     self.eval()
+    #     embeddings = defaultdict(list)
+    #     with torch.no_grad():
+    #         for batch in dataloader:
+    #             A, V, T = (
+    #                 batch[Modality.AUDIO].to(device).float(),
+    #                 batch[Modality.VIDEO].to(device).float(),
+    #                 batch[Modality.TEXT].to(device).float(),
+    #             )
+    #             a_embd = self.netA(A)
+    #             v_embd = self.netV(V)
+    #             t_embd = self.netT(T)
 
-                for mod, embd in zip([Modality.AUDIO, Modality.VIDEO, Modality.TEXT], [a_embd, v_embd, t_embd]):
-                    if embd is not None:
-                        embeddings[mod].append(safe_detach(embd))
-                embeddings["label"] += batch["label"]
+    #             for mod, embd in zip([Modality.AUDIO, Modality.VIDEO, Modality.TEXT], [a_embd, v_embd, t_embd]):
+    #                 if embd is not None:
+    #                     embeddings[mod].append(safe_detach(embd))
+    #             embeddings["label"] += batch["label"]
 
-        # embeddings: Dict[Modality, np.ndarray] = {mod: np.concatenate(embds) for mod, embds in embeddings.items()}
+    #     # embeddings: Dict[Modality, np.ndarray] = {mod: np.concatenate(embds) for mod, embds in embeddings.items()}
 
-        return embeddings
+    #     return embeddings

@@ -254,7 +254,13 @@ class GMUModel(Module):
 
         metric_recorder.update_group_all("classification", predictions=predictions, targets=labels, m_types=miss_type)
 
-        return {"loss": loss.item()}
+        return {
+            "loss": loss.item(),
+            "targets": labels,
+            "predictions": predictions,
+            "logits": safe_detach(logits),
+            "miss_type": miss_type,
+        }
 
     def __str__(self) -> str:
         """

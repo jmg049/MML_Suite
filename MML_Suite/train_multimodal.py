@@ -341,6 +341,7 @@ def train_epoch(
             monitor.step()
         console.update_task("Training", advance=1)
     time_taken = time.time() - start_time
+    time_taken /= len(train_loader)
 
     console.complete_task("Training")
 
@@ -357,6 +358,7 @@ def validate_epoch(
     metric_recorder: MetricRecorder,
     monitor: Optional[ExperimentMonitor] = None,
     task_name: str = "Validation",
+    ret_outputs: bool = False,
 ) -> Tuple[float, float, Dict[str, List[float]]]:
     """
     Run one validation epoch.
@@ -375,17 +377,30 @@ def validate_epoch(
         Tuple[float, float]: Average loss and time per batch for this epoch.
     """
     model.eval()
-    start_time = time.time()
+    targets = []
+    preds = []
+    logits = []
+    miss_types = []
     losses = defaultdict(list)
 
     console.start_task(task_name, total=len(val_loader), style="bright yellow")
+
+    start_time = time.time()
 
     with torch.no_grad():
         for batch in val_loader:
             validation_output = model.validation_step(
                 batch, loss_functions=loss_functions, device=device, metric_recorder=metric_recorder
             )
+            validation_target = validation_output["targets"]
+            validation_pred = validation_output["predictions"]
+            validation_logits = validation_output["logits"]
+            validation_miss_types = validation_output["miss_type"]
 
+            targets.append(validation_target)
+            preds.append(validation_pred)
+            logits.append(validation_logits)
+            miss_types.extend(validation_miss_types)
             loss = validation_output["loss"]
             other_losses = validation_output.get("losses", None)
 
@@ -398,10 +413,19 @@ def validate_epoch(
             if monitor:
                 monitor.step()
             console.update_task(task_name, advance=1)
+    time_taken = time.time() - start_time
+    time_taken /= len(val_loader)
+    time_taken = round(time_taken, 8)
     console.complete_task(task_name)
 
     losses = {key: np.mean(value) for key, value in losses.items()}
-    time_taken = time.time() - start_time
+    targets = np.concat(targets)
+    preds = np.concat(preds)
+    logits = np.concat(logits)
+    # miss_types = np.concat(miss_types)
+
+    if ret_outputs:
+        return losses["loss"], time_taken, losses, (targets, preds, logits, miss_types)
     return losses["loss"], time_taken, losses
 
 
@@ -418,7 +442,7 @@ def _train_loop(
     experiment_data: Optional[Dict[str, Any]] = None,
     monitor: Optional[ExperimentMonitor] = None,
     checkpoint_mode: Literal["minimize", "maximize"] = "minimize",
-) -> Dict[str, Any]:
+) -> Optional[Dict[str, Any]]:
     """
     Perform the training loop over all epochs.
 
@@ -462,6 +486,7 @@ def _train_loop(
         train_metrics["loss"] = train_loss
         experiment_data["metrics_history"]["train"].append(train_metrics.copy())
         experiment_data["timing_history"]["train"].append(train_time)
+        console.print(f"Keys: {train_metrics.keys()}")
         console.display_validation_metrics(train_metrics)
 
         metric_recorder.reset()
@@ -515,7 +540,7 @@ def _train_loop(
 
         config_do_early_stopping: bool = config.training.early_stopping
 
-        ## Only stop early if the config says to do so AND the check_early_stopping function says to do so.
+        # Only stop early if the config says to do so AND the check_early_stopping function says to do so.
         if config_do_early_stopping and not should_continue:
             console.print("[bold red]Early stopping triggered. Stopping training.[/]")
             break
@@ -544,6 +569,7 @@ def test(
     checkpoint_manager: CheckpointManager,
     experiment_data: Optional[Dict[str, Any]] = None,
     monitor: Optional[ExperimentMonitor] = None,
+    metrics_out_fmt: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Perform testing on the model using the specified data loaders.
@@ -572,7 +598,7 @@ def test(
         console.print(f"\n[bold cyan]Testing on {split_name} split[/]")
 
         with torch.no_grad():
-            test_loss, test_time, test_loss_info = validate_epoch(
+            test_loss, test_time, test_loss_info, (targets, preds, logits, miss_types) = validate_epoch(
                 model=model,
                 val_loader=loader,
                 loss_functions=loss_functions,
@@ -580,7 +606,8 @@ def test(
                 console=console,
                 metric_recorder=metric_recorder,
                 monitor=monitor,
-                task_name=f"Testing {split_name}",
+                task_name="test",
+                ret_outputs=True,
             )
 
         metrics = metric_recorder.calculate_all_groups(loss=test_loss, skip_tensorboard=True)
@@ -588,6 +615,43 @@ def test(
         metrics.update({k: np.mean(v) for k, v in test_loss_info.items()})
         experiment_data["metrics_history"][split_name] = metrics
         experiment_data["timing_history"][split_name] = [test_time]
+    # output
+    if metrics_out_fmt:
+        metrics_out_fmt = str(metrics_out_fmt)
+
+        timing = metrics_out_fmt.format(targ="params_timing")
+        timing = Path(timing).with_suffix(".txt")
+        os.makedirs(timing.parent, exist_ok=True)
+        with open(timing, "w+") as f:
+            parameter_count = sum(p.numel() for p in model.parameters() if p.requires_grad)
+            f.write(f"parameter_count: {parameter_count}\n")
+            f.write(f"test_time: {test_time}")
+            console.print(f"> Saved test timing ({test_time}s) to {timing}")
+        targets_path = metrics_out_fmt.format(targ="targets")
+        preds_path = metrics_out_fmt.format(targ="preds")
+        logits_path = metrics_out_fmt.format(targ="logits")
+        miss_types_path = metrics_out_fmt.format(targ="miss_types")
+
+        np.save(targets_path, targets)
+        np.save(preds_path, preds)
+        np.save(logits_path, logits)
+        # np.save(miss_types_path, miss_types)
+        with open(Path(miss_types_path).with_suffix(".json"), "w+") as jfp:
+            json.dump(miss_types, jfp)
+
+
+        metrics_path = Path(metrics_out_fmt.format(targ="metrics")).with_suffix(".json")
+    
+        # write metrics
+        with open(metrics_path, "w+") as jfp:
+            
+            json.dump(prepare_metrics_for_json([metrics]), jfp)
+
+        console.print(f"> Saved targets with shape {targets.shape} to {targets_path}")
+        console.print(f"> Saved targets with shape {preds.shape} to {preds_path}")
+        console.print(f"> Saved targets with shape {logits.shape} to {logits_path}")
+        console.print(f"> Saved miss_types with len {len(miss_types)} to {miss_types_path}")
+
         console.display_validation_metrics(metrics)
 
     return experiment_data["metrics_history"]
@@ -619,6 +683,12 @@ def main_cross_validation(config: StandardMultimodalConfig) -> Tuple[Module, Dic
         fold_output_dir.mkdir(parents=True, exist_ok=True)
         config.logging.model_output_path = str(fold_output_dir)
 
+        # Clean old checkpoints for this fold
+        logger.debug("Cleaning up old checkpoints...")
+        clean_checkpoints(
+            fold_output_dir
+        )
+
         for dataset_config in config.data.datasets.values():
             dataset_config.kwargs["cv_no"] = fold_index
 
@@ -632,34 +702,91 @@ def main_cross_validation(config: StandardMultimodalConfig) -> Tuple[Module, Dic
             config=config, output_dir=fold_output_dir, model=model
         )
 
-        try:
-            # Train and validate
-            _ = _train_loop(
-                config=config,
-                model=model,
-                dataloaders=dataloaders,
-                optimizer=optimizer,
-                loss_functions=loss_functions,
-                device=device,
-                metric_recorder=metric_recorder,
-                checkpoint_manager=checkpoint_manager,
-                scheduler=scheduler,
-                experiment_data=experiment_data,
-                monitor=monitor,
-            )
+        # Add model information to experiment data
+        experiment_data["model_info"]["architecture"] = str(model)
+        experiment_data["model_info"]["parameters"] = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        experiment_data["model_info"]["size"] = (
+            sum(p.numel() for p in model.parameters()) * PARAMETER_SIZE_BYTES / 1024 / 1024
+        )  # in MB
+        if config.experiment.dry_run:
+            console.print("[yellow]Dry run completed for fold. Exiting.[/]")
+            return model, experiment_data, fold_output_dir
+        logger.info(gpu_memory)
 
-            # Test
-            test_metrics = test(
-                model=model,
-                dataloaders=dataloaders,
-                loss_functions=loss_functions,
-                device=device,
-                metric_recorder=metric_recorder,
-                checkpoint_manager=checkpoint_manager,
-                experiment_data=experiment_data,
-                monitor=monitor,
-            )
-            fold_metrics[fold_index] = test_metrics
+        try:
+            # Train and validate (only if is_train is enabled)
+            if config.experiment.is_train:
+                _ = _train_loop(
+                    config=config,
+                    model=model,
+                    dataloaders=dataloaders,
+                    optimizer=optimizer,
+                    loss_functions=loss_functions,
+                    device=device,
+                    metric_recorder=metric_recorder,
+                    checkpoint_manager=checkpoint_manager,
+                    scheduler=scheduler,
+                    experiment_data=experiment_data,
+                    monitor=monitor,
+                    checkpoint_mode="minimize" if config.logging.save_metric == "loss" else "maximize",
+                )
+
+            # Test (only if is_test is enabled)
+            if config.experiment.is_test:
+                test_metrics = test(
+                    model=model,
+                    dataloaders=dataloaders,
+                    loss_functions=loss_functions,
+                    device=device,
+                    metric_recorder=metric_recorder,
+                    checkpoint_manager=checkpoint_manager,
+                    experiment_data=experiment_data,
+                    monitor=monitor,
+                    metrics_out_fmt=config.logging.metrics_path / f"fold_{fold_index}" / "test_{targ}.npy",
+                )
+                fold_metrics[fold_index] = test_metrics
+
+                # Process embeddings if available
+                if hasattr(model, "get_embeddings") and "embeddings" in dataloaders:
+                    console.print("[bold cyan]Generating embeddings for visualization...[/]")
+                    embeddings = model.get_embeddings(dataloaders["embeddings"], device=device)
+
+                    fold_embeddings_dir = config.logging.metrics_path / f"fold_{fold_index}" / "embeddings"
+
+                    if embeddings is not None and isinstance(embeddings, dict):
+                        for modality, embds in embeddings.items():
+                            if not isinstance(modality, str) and isinstance(embds, list):
+                                embds = np.concatenate(embds, axis=0)
+                                console.print(f"Embeddings shape: {embds.shape}")
+
+                            if isinstance(modality, str):
+                                ## We're dealing with labels
+                                save_fp = fold_embeddings_dir / "labels.npy"
+                            else:
+                                save_fp = fold_embeddings_dir / f"{modality}_embeddings.npy"
+                            os.makedirs(save_fp.parent, exist_ok=True)
+                            try:
+                                np.save(save_fp, embds)
+                            except Exception as e:
+                                console.print(f"[bold red]Error saving embeddings: {e}[/]")
+                                console.print(f"Embeddings shape: {len(embds)}")
+                                raise e
+                            console.print(f"[green]✓[/] Saved {modality} embeddings to: {save_fp}")
+                    elif embeddings is not None and isinstance(embeddings, tuple):
+                        embeddings, reconstructions = embeddings
+                        for modality, embd in embeddings.items():
+                            embeddings_save_fp = fold_embeddings_dir / f"{modality}_embeddings.npy"
+                            os.makedirs(embeddings_save_fp.parent, exist_ok=True)
+                            np.save(embeddings_save_fp, embd)
+                            console.print(f"[green]✓[/] Saved embeddings to: {embeddings_save_fp}")
+
+                        for modality, recon in reconstructions.items():
+                            reconstructions_save_fp = fold_embeddings_dir / f"{modality}_reconstructions.npy"
+                            os.makedirs(reconstructions_save_fp.parent, exist_ok=True)
+                            np.save(reconstructions_save_fp, recon)
+                            console.print(f"[green]✓[/] Saved reconstructions to: {reconstructions_save_fp}")
+                else:
+                    console.print("[bold yellow]![/] Model / Data configuration does not support gathering embeddings")
 
         finally:
             if monitor:
@@ -670,6 +797,7 @@ def main_cross_validation(config: StandardMultimodalConfig) -> Tuple[Module, Dic
 
     console.complete_task("Cross-Validation")
 
+    # Aggregate and save metrics
     _train_metrics = []
     _val_metrics = []
     _test_metrics = []
@@ -777,6 +905,10 @@ def main_cross_validation(config: StandardMultimodalConfig) -> Tuple[Module, Dic
         json.dump(prepare_metrics_for_json(test_metrics), f, indent=4)
     console.print(f"[green]✓[/] Saved aggregated test metrics to: {test_output_path}")
 
+    # Generate final report
+    report_path = report_generator.generate_report(experiment_data)
+    console.print(f"[green]Cross-validation experiment completed. Report saved at: {report_path}[/]")
+
     return model, experiment_data, fold_output_dir
 
 
@@ -847,6 +979,7 @@ def main(
                 checkpoint_manager=checkpoint_manager,
                 experiment_data=experiment_data,
                 monitor=monitor,
+                metrics_out_fmt=config.logging.metrics_path / "test_{targ}.npy",
             )
 
             if hasattr(model, "get_embeddings") and "embeddings" in dataloaders:

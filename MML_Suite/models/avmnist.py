@@ -355,9 +355,17 @@ class AVMNIST(Module, MultimodalMonitoringMixin):
                     "predictions": predictions,
                     "labels": labels,
                     "miss_types": miss_type,
+                    "logits": safe_detach(logits),
+                    "targets": labels,
                 }
 
-        return {"loss": loss.item()}
+        return {
+            "loss": loss.item(),
+            "logits": safe_detach(logits),
+            "predictions": predictions,
+            "targets": labels,
+            "miss_type": miss_type,
+        }
 
     def get_embeddings(self, dataloader: DataLoader, device: torch.device) -> Dict[Modality, np.ndarray]:
         """

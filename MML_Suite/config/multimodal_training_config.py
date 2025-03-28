@@ -284,8 +284,11 @@ class StandardMultimodalConfig(BaseExperimentConfig):
     def load(cls, path: Union[str, Path, PathLike], run_id: int) -> "StandardMultimodalConfig":
         """Load and create configuration from YAML file."""
         console.print(f"\nLoading configuration from: {path}")
+        import os
 
         try:
+            console.print(os.path.exists(path))
+            console.print(os.path.exists(Path(path).parent))
             with open(path, "r") as f:
                 data = yaml.safe_load(f)
 
@@ -339,6 +342,11 @@ class StandardMultimodalConfig(BaseExperimentConfig):
             return config
 
         except Exception as e:
+            import os
+
+            console.print(os.listdir(Path(path).parent))
+            console.print(os.getcwd())
+
             error_msg = f"Error loading configuration: {str(e)}"
             logger.error(f"{error_msg}\n{traceback.format_exc()}")
             console.print(f"[red]✗[/] {error_msg}")

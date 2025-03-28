@@ -5,6 +5,7 @@ from typing import Optional
 import numpy as np
 import torch
 from experiment_utils.utils import safe_detach
+from experiment_utils.printing import get_console
 from models.mixins import MultimodalMonitoringMixin
 from experiment_utils.loss import LossFunctionGroup
 from experiment_utils.metric_recorder import MetricRecorder
@@ -16,6 +17,8 @@ from data.kinetics_sounds import KineticsSounds as KineticsSoundDataset
 from modalities import Modality
 from torch.nn import Module, AvgPool2d, Linear, ReLU, Dropout, Module
 from torch import Tensor
+
+console = get_console()
 
 
 class KineticsSoundsAudioEncoder(Module):
@@ -56,6 +59,7 @@ class KineticsSoundsAudioEncoder(Module):
         return self.embedding_size
 
     def forward(self, audio: Tensor) -> Tensor:
+        audio = audio.unsqueeze(1)
         x = self.conv_block_one(audio)
         x = self.avg_pool_one(x)
         x = self.conv_block_two(x)
@@ -124,16 +128,18 @@ class KineticsSounds(Module, MultimodalMonitoringMixin):
     def forward(
         self, A: Optional[Tensor] = None, V: Optional[Tensor] = None, is_embd_A: bool = False, is_embd_V: bool = False
     ) -> Tensor:
-        assert not all((A is None, V is None)), "At least one of A, V must be provided"
-        assert not all([is_embd_A, is_embd_V]), "Only one of is_embd_A, is_embd_V can be True"
+        # assert not all((A is None, V is None)), "At least one of A, V must be provided"
+        # assert not all([is_embd_A, is_embd_V]), "Only one of is_embd_A, is_embd_V can be True"
 
         A = A if A is not None else torch.zeros(V.size(0), self.audio_encoder.get_embedding_size())
         V = V if V is not None else torch.zeros(A.size(0), self.video_encoder.get_embedding_size())
 
-        A = A.unsqueeze(1)
-
         audio = self.audio_encoder(A) if not is_embd_A else A
         video = self.video_encoder(V) if not is_embd_V else V
+
+        # print(f"Audio Shape: {audio.shape}")
+        # print(f"Video Shape: {video.shape}")
+
         fused = torch.cat((audio, video), dim=1)
         x = self.fc_one(fused)
         x = self.ReLU(x)
@@ -219,6 +225,10 @@ class KineticsSounds(Module, MultimodalMonitoringMixin):
 
         return {
             "loss": loss.item(),
+            "predictions": predictions,
+            "targets": labels,
+            "logits": safe_detach(logits),
+            "miss_type": miss_type,
         }
 
     def get_embeddings(self, dataloader: DataLoader, device: torch.device) -> Dict[Modality, np.ndarray]:

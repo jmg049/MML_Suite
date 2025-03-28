@@ -249,6 +249,9 @@ class MetricRecorder:
             if "loss" in metric_name:
                 continue
 
+            if "ConfusionMatrix" in metric_name:
+                continue
+
             if self.tb_record_only:
                 for pattern in self.tb_record_only:
                     if re.match(pattern, metric_name):

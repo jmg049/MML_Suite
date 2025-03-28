@@ -1,0 +1,171 @@
+!StandardConfig
+experiment: !ExperimentConfig
+  name: "Kinetics Sounds Baseline"
+  device: "cuda"
+  train_print_interval_epochs: 1
+  validation_print_interval_epochs: 1
+  is_train: true
+  is_test: true
+
+model: !ModelConfig
+  name: "KineticsSounds"
+  model_type: "KineticsSounds"
+
+  audio_encoder: !KineticsSoundsAudioEncoder
+    conv_block_one: !ConvBlock
+      conv_block_one_args: !ConvBlockArgs
+        conv_one_in: 1
+        conv_one_out: 32
+      conv_block_two_args: !ConvBlockArgs
+        conv_one_in: 32
+        conv_one_out: 64
+    conv_block_two: !ConvBlock
+      conv_block_one_args: !ConvBlockArgs
+        conv_one_in: 64
+        conv_one_out: 64
+      conv_block_two_args: !ConvBlockArgs
+        conv_one_in: 64
+        conv_one_out: 64
+    conv_block_three: !ConvBlock
+      conv_block_one_args: !ConvBlockArgs
+        conv_one_in: 64
+        conv_one_out: 128
+      conv_block_two_args: !ConvBlockArgs
+        conv_one_in: 128
+        conv_one_out: 128
+    kernel_size_one: [2,2]
+    kernel_size_two: [4,4]
+    kernel_size_three: [4,8]
+
+  video_encoder: !KineticsSoundsVideoEncoder
+    fc_one_input_size: 400
+    hidden_dim_one: 256
+    hidden_dim_two: 128
+
+  hidden_dim_one: 64
+  hidden_dim_two: 32
+
+training:
+  epochs: 40
+  early_stopping: true
+  early_stopping_patience: 15
+  num_modalities: 2
+  optimizer: !Optimizer
+    name: "Adam"
+    default_kwargs:
+      lr: 0.0005
+      weight_decay: 0.00004
+  loss_functions: !LossFunctionGroup
+    cross_entropy: 
+      loss_name: "cross_entropy"
+      loss_args: {}
+      weight: 1.0  
+
+data: !DataConfig
+  datasets:
+    train: !DatasetConfig
+      dataset: "kinetics_sounds"
+      data_fp: "$DATA/kinetics_sounds/train.csv"
+      split: "train"
+      target_modality: !Modality "MULTIMODAL"
+      batch_size: 128
+      shuffle: true
+      kwargs:
+        labels_key: "class"
+      missing_patterns: !MissingPatternConfig
+        modalities:
+          !Modality text: !ModalityConfig
+            missing_rate: 0.0
+          !Modality image: !ModalityConfig
+            missing_rate: 0.0
+        selected_patterns: ["av"]
+    validation: !DatasetConfig
+      dataset: "kinetics_sounds"
+      data_fp: "$DATA/kinetics_sounds/validation.csv"
+      split: "val"
+      target_modality: !Modality "MULTIMODAL"
+      shuffle: true
+      batch_size: 128
+      kwargs:
+        labels_key: "class"
+      missing_patterns: !MissingPatternConfig
+        modalities:
+          !Modality text: !ModalityConfig
+            missing_rate: 0.0
+          !Modality image: !ModalityConfig
+            missing_rate: 0.0
+        selected_patterns: ["av", "a", "v"]
+    test: !DatasetConfig
+      dataset: "kinetics_sounds"
+      data_fp: "$DATA/kinetics_sounds/test.csv"
+      split: "test"
+      target_modality: !Modality "MULTIMODAL"
+      shuffle: true
+      batch_size: 128
+      kwargs:
+        labels_key: "class"
+      missing_patterns: !MissingPatternConfig
+        modalities:
+          !Modality text: !ModalityConfig
+            missing_rate: 0.0
+          !Modality image: !ModalityConfig
+            missing_rate: 0.0
+        selected_patterns: ["av", "a", "v"]
+metrics:
+  metrics:
+    f1_weighted:
+      function: "sklearn.metrics.f1_score"
+      kwargs:
+        average: "weighted"
+        zero_division: 0
+    f1_micro:
+      function: "sklearn.metrics.f1_score"
+      kwargs:
+        average: "micro"
+        zero_division: 0
+    precision_weighted:
+      function: "sklearn.metrics.precision_score"
+      kwargs:
+        average: "weighted"
+        zero_division: 0
+    recall_weighted:
+      function: "sklearn.metrics.recall_score"
+      kwargs:
+        average: "weighted"
+        zero_division: 0
+    recall_micro:
+      function: "sklearn.metrics.recall_score"
+      kwargs:
+        average: "micro"
+        zero_division: 0
+    accuracy:
+      function: "sklearn.metrics.accuracy_score"
+    ConfusionMatrix:
+      function: "sklearn.metrics.confusion_matrix"
+      kwargs:
+        labels: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11,12,13,14,15,16,17,18,19,20,21,22]
+  groups:
+    classification: ["f1_weighted", "f1_micro", "precision_weighted", "recall_weighted", "recall_micro", "accuracy", "ConfusionMatrix"]
+
+logging:
+  log_path: "$EXP_PATH/experiments_output/wch1/{experiment_name}/logs/{run_id}"
+  model_output_path: "$EXP_PATH/experiments_output/wch1/{experiment_name}/models/{run_id}"
+  metrics_path: "$EXP_PATH/experiments_output/wch1/{experiment_name}/metrics/{run_id}"
+  save_metric: "loss"
+  monitor_path: "$EXP_PATH/experiments_output/wch1/{experiment_name}/monitoring/{run_id}"
+  tensorboard_path: "$EXP_PATH/experiments_output/wch1/{experiment_name}/tensorboard/{run_id}"
+
+
+monitoring:
+  enabled: false
+  gradient_interval: 100
+  activation_interval: 100
+  weight_interval: 200
+  buffer_size: 1000
+  compression: "gzip"
+  compression_opts: 4
+  enable_gradient_tracking: true
+  enable_activation_tracking: true
+  enable_weight_tracking: true
+  enable_layer_convergence: true
+  enable_information_flow: false

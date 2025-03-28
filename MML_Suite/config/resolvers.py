@@ -16,6 +16,7 @@ console = get_console()
 
 
 def resolve_model_name(_type: str) -> Type[MultimodalModelProtocol]:
+    console.print(f"Resolving {_type}")
     match _type.lower():
         case "avmnist":
             from models.avmnist import AVMNIST
@@ -61,6 +62,12 @@ def resolve_model_name(_type: str) -> Type[MultimodalModelProtocol]:
             from models.cmams import CMAM
 
             return CMAM
+
+        case "simple_cmam":
+            from models.cmams import SimpleCMAM
+
+            return SimpleCMAM
+
         case "kineticssounds":
             from models.kinetics_sounds import KineticsSounds
 
