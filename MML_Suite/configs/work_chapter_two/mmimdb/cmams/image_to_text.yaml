@@ -1,0 +1,184 @@
+!CMAMConfig
+experiment: !ExperimentConfig
+  name: "MM_IMDb Image to Text CMAM Baseline"
+  device: "cuda"
+  train_print_interval_epochs: 1
+  validation_print_interval_epochs: 1
+  is_train: true
+  is_test: true
+
+model: !ModelConfig
+  name: "MMIMDb"
+  model_type: "MMIMDb"
+  pretrained_path: "$EXP_PATH/wch1/mm_imdb_Baseline_Multimodal_Training/models/{run_id}/best.pth"
+  image_encoder: !MMIMDbModalityEncoder
+    input_dim: 4096
+    output_dim: 512
+  
+  text_encoder: !MMIMDbModalityEncoder
+    input_dim: 300
+    output_dim: 512
+
+  gated_bimodal_network: !GatedBiModalNetwork
+    input_one_dim: 512
+    output_one_dim: 512
+    input_two_dim: 512
+    output_two_dim: 512
+
+  classifier: !MLPGenreClassifier
+    input_size: 512
+    hidden_size: 512
+    output_size: 23
+
+cmam: !ModelConfig
+  name: "Simple_CMAM"
+  model_type: "Simple_CMAM"
+  target_modality: !Modality text
+  load_pretrained_encoder_state_for: []
+  labels_key: "label"
+  input_modalities: 
+    - !Modality Image
+  association_network: !AssociationNetwork
+    input_size: 512
+    hidden_size: 256
+    output_size: 512
+    dropout: 0.4
+    batch_norm: True
+
+training:
+  epochs: 50
+  early_stopping: true
+  early_stopping_patience: 10
+  num_modalities: 2
+  optimizer: !Optimizer
+    name: "Adam"
+    default_kwargs:
+      lr: 0.00001
+      weight_decay: 0.001
+  loss_functions: !LossFunctionGroup
+    cmam: 
+      loss_name: "cmam"
+      loss_kwargs: {
+        cosine_weight: 0.0,
+        mse_weight: 1.0,
+        mae_weight: 0.0,
+        cls_weight: 0.00
+      }
+      weight: 1.0  
+
+data: !DataConfig
+  datasets:
+    train: !DatasetConfig
+      dataset: "mm_imdb"
+      data_fp: "$DATA/mmimdb/train.hdf5"
+      split: "train"
+      target_modality: !Modality "MULTIMODAL"
+      batch_size: 128
+      shuffle: true
+      missing_patterns: !MissingPatternConfig
+        modalities:
+          !Modality text: !ModalityConfig
+            missing_rate: 0.0
+          !Modality image: !ModalityConfig
+            missing_rate: 0.0
+        selected_patterns: ["it"]
+    validation: !DatasetConfig
+      dataset: "mm_imdb"
+      data_fp: "$DATA/mmimdb/validation.hdf5"
+      split: "val"
+      target_modality: !Modality "MULTIMODAL"
+      shuffle: true
+      batch_size: 128
+      missing_patterns: !MissingPatternConfig
+        modalities:
+          !Modality text: !ModalityConfig
+            missing_rate: 0.0
+          !Modality image: !ModalityConfig
+            missing_rate: 0.0
+        selected_patterns: ["it"]
+    test: !DatasetConfig
+      dataset: "mm_imdb"
+      data_fp: "$DATA/mmimdb/test.hdf5"
+      split: "test"
+      target_modality: !Modality "MULTIMODAL"
+      shuffle: true
+      batch_size: 128
+      missing_patterns: !MissingPatternConfig
+        modalities:
+          !Modality text: !ModalityConfig
+            missing_rate: 0.0
+          !Modality image: !ModalityConfig
+            missing_rate: 0.0
+        selected_patterns: ["it"]
+    embeddings: !DatasetConfig
+      dataset: "mm_imdb"
+      data_fp: "$DATA/mmimdb/test.hdf5"
+      split: "test"
+      target_modality: !Modality "MULTIMODAL"
+      shuffle: true
+      batch_size: 128
+      missing_patterns: !MissingPatternConfig
+        modalities:
+          !Modality text: !ModalityConfig
+            missing_rate: 0.0
+          !Modality image: !ModalityConfig
+            missing_rate: 0.0
+        selected_patterns: ["it"]
+
+metrics:
+  metrics:
+    f1_samples:
+      function: "sklearn.metrics.f1_score"
+      kwargs:
+        average: "samples"
+        zero_division: 0
+    f1_macro:
+      function: "sklearn.metrics.f1_score"
+      kwargs:
+        average: "macro"
+        zero_division: 0
+    f1_weighted:
+      function: "sklearn.metrics.f1_score"
+      kwargs:
+        average: "weighted"
+        zero_division: 0
+    f1_micro:
+      function: "sklearn.metrics.f1_score"
+      kwargs:
+        average: "micro"
+        zero_division: 0
+    mae:
+      function: "sklearn.metrics.mean_absolute_error"
+      kwargs: {}
+    mse:
+      function: "sklearn.metrics.mean_squared_error"
+      kwargs: {}
+    cosine:
+      function: "metrics.cosine_similarity"
+      kwargs: {}
+  groups:
+    classification: ["f1_samples", "f1_macro", "f1_weighted", "f1_micro"]
+    reconstruction: ["mae", "mse", "cosine"]
+
+
+logging:
+  log_path: "$EXP_PATH/wch2/{experiment_name}/logs/{run_id}"
+  model_output_path: "$EXP_PATH/wch2/{experiment_name}/models/{run_id}"
+  metrics_path: "$EXP_PATH/wch2/{experiment_name}/metrics/{run_id}"
+  save_metric: "loss"
+  monitor_path: "$EXP_PATH/wch2/{experiment_name}/monitoring/{run_id}"
+
+
+monitoring:
+  enabled: false
+  gradient_interval: 100
+  activation_interval: 100
+  weight_interval: 200
+  buffer_size: 1000
+  compression: "gzip"
+  compression_opts: 4
+  enable_gradient_tracking: true
+  enable_activation_tracking: true
+  enable_weight_tracking: true
+  enable_layer_convergence: true
+  enable_information_flow: false

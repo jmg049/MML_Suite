@@ -22,6 +22,9 @@ def resolve_model_name(_type: str) -> Type[MultimodalModelProtocol]:
             from models.avmnist import AVMNIST
 
             return AVMNIST
+        case "avmnist_corenet":
+            from models.corenet import AVMNISTCoreNet
+            return AVMNISTCoreNet
         case "self-mm":
             from models.msa.self_mm import Self_MM
 
@@ -31,7 +34,7 @@ def resolve_model_name(_type: str) -> Type[MultimodalModelProtocol]:
 
             return UttFusionModel
         case "mmin":
-            from models.msa.mmin import MMIN
+            from models.msa.mmin import MMINModel as MMIN
 
             return MMIN
         case "redcore":
@@ -67,6 +70,11 @@ def resolve_model_name(_type: str) -> Type[MultimodalModelProtocol]:
             from models.cmams import SimpleCMAM
 
             return SimpleCMAM
+        
+        case "contrastive_simple_cmam":
+            from models.contrastive_cmam import ContrastiveSimpleCMAM
+
+            return ContrastiveSimpleCMAM
 
         case "kineticssounds":
             from models.kinetics_sounds import KineticsSounds
@@ -197,6 +205,7 @@ def resolve_dataset_name(dataset_name: str) -> Type[MultimodalBaseDataset]:
         "msp_improv": MSP_IMPROV,
         "mm_imdb": MMIMDb,
         "kinetics_sounds": KineticsSounds,
+        "contrastive_avmnist": lambda: __import__('data.contrastive_dataset', fromlist=['ContrastiveAVMNIST']).ContrastiveAVMNIST,
     }
 
     dataset_name = dataset_name.lower()

@@ -1,13 +1,14 @@
 from os import PathLike
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional
-from modalities import Modality
+from modalities import Modality, add_modality
 import pandas as pd
 from torch import Tensor
 import torch
 
 from data.base_dataset import MultimodalBaseDataset
 
+_ = add_modality("VIDEO")
 
 class KineticsSounds(MultimodalBaseDataset):
     VALID_SPLITS: list[Literal["train", "val", "test"]] = ["train", "val", "test"]
@@ -30,20 +31,20 @@ class KineticsSounds(MultimodalBaseDataset):
         *,
         missing_patterns: Optional[Dict[str, Dict[str, float]]] = None,
         selected_patterns: Optional[list[str]] = None,
+        missing_strategy: Literal["noise", "zero"] = "zero",
         audio_key: str = "audio",
         video_key: str = "video",
         labels_key: str = "label",
         split_indices: Optional[List[int]] = None,
         _id: int = 1,
+        **kwargs: Any
     ):
         m_patterns = missing_patterns or {
             "av": {Modality.AUDIO: 1.0, Modality.VIDEO: 1.0},
             "a": {Modality.AUDIO: 1.0, Modality.VIDEO: 0.0},
             "v": {Modality.AUDIO: 0.0, Modality.VIDEO: 1.0},
         }
-        super(KineticsSounds, self).__init__(
-            split=split, selected_patterns=selected_patterns, missing_patterns=m_patterns, _id=_id
-        )
+
         assert (
             split in KineticsSounds.VALID_SPLITS
         ), f"Invalid split: {split}, must be one of {KineticsSounds.VALID_SPLITS}"
@@ -51,6 +52,16 @@ class KineticsSounds(MultimodalBaseDataset):
         data_fp = Path(data_fp)
         if not data_fp.exists():
             raise FileNotFoundError(f"File not found: {data_fp}")
+
+
+        modality_stats = {
+            Modality.AUDIO: {"mean": 0.0, "std": 3.1276},
+            Modality.VIDEO: {"mean": 160719.6702, "std": 564025.9526}
+        }
+
+        super(KineticsSounds, self).__init__(
+            split=split, selected_patterns=selected_patterns, missing_patterns=m_patterns, _id=_id, modality_stats=modality_stats,
+            missing_strategy=missing_strategy        )
 
         self.data = pd.read_csv(data_fp)
         assert isinstance(target_modality, Modality), "Invalid modality provided, must be a Modality"

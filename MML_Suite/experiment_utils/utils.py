@@ -1,10 +1,11 @@
 import logging
 import os
+from pathlib import Path
 import re
 import warnings
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Dict, List, Optional, TypeVar, Union
+from typing import Any, Dict, List, Literal, Optional, TypeVar, Union
 
 import h5py
 import numpy as np
@@ -15,13 +16,15 @@ from torch import Tensor
 from torch.nn import BatchNorm2d, Conv2d, Linear, Module, init
 from typing_extensions import TypeGuard
 
-from .printing import get_console
+
+from .printing import get_console, print_debug, print_info, print_warning
 
 console = get_console()
 
 torch.set_default_dtype(torch.float32)
 
 PARAMETER_SIZE_BYTES: int = 4  # Size of a float parameter in bytes
+CONDITION: str = "congruent"  # Default condition for modality assignment
 
 
 T = TypeVar("T")  # Return type
@@ -250,12 +253,11 @@ class SafeDict(dict):
 
 
 def gpu_memory() -> str:
-    if torch.cuda.is_available():
-        return (
-            f"Allocated:\t{torch.cuda.memory_allocated()/1e9:.2f}GB\nCached:\t{torch.cuda.memory_reserved()/1e9:.2f}GB"
-        )
-    else:
-        raise Exception("gpu_memory function called, but gpu is not available")
+    return (
+        f"Allocated:\t{torch.cuda.memory_allocated()/1e9:.2f}GB\nCached:\t{torch.cuda.memory_reserved()/1e9:.2f}GB"
+        if torch.cuda.is_available()
+        else "!!!GPU not available!!!"
+    )
 
 
 def to_gpu_safe(x: Tensor | Dict[str | Modality, Tensor | Any]) -> Tensor | Dict[str | Modality, Tensor | Any]:
@@ -292,6 +294,7 @@ def kaiming_init(module: Module) -> None:
 
 def clean_checkpoints(
     checkpoints_dir: str,
+    round: Optional[int] = None,
     keep_epochs: List[int] = None,
     keep_best: bool = True,
     keep_last: bool = True,
@@ -311,6 +314,9 @@ def clean_checkpoints(
     Returns:
     - Optional[str]: Path to the last kept checkpoint, or None if no checkpoints were kept.
     """
+    if round is not None:
+        checkpoints_dir = os.path.join(checkpoints_dir, f"round_{round}")
+
     if not os.path.exists(checkpoints_dir):
         console.print(f"Directory {checkpoints_dir} does not exist.")
         return None
@@ -371,9 +377,10 @@ def safe_detach(tensor: Tensor | ndarray, to_np: bool = True) -> Tensor | ndarra
     Returns:
         Detached tensor or numpy array
     """
-    assert isinstance(tensor, Tensor) or isinstance(
-        tensor, ndarray
-    ), f"Expected tensor or numpy array, got {type(tensor)}"
+    assert (
+        isinstance(tensor, Tensor) or isinstance(tensor, ndarray) or isinstance(tensor, list)
+    ), f"Expected tensor, list or numpy array, got {type(tensor)}"
+
     match isinstance(tensor, Tensor):
         case True:
             if to_np:
@@ -383,13 +390,19 @@ def safe_detach(tensor: Tensor | ndarray, to_np: bool = True) -> Tensor | ndarra
             return tensor
 
 
-def prepare_metrics_for_json(metrics_list: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def prepare_metrics_for_json(metrics_list: List[Dict[str, Dict[str, Any]]]) -> List[Dict[str, Dict[str, Any]]]:
     """
-    Convert metrics to JSON-serializable format, handling numpy types.
+    Recursively convert metrics to JSON-serializable format, handling numpy types.
     """
 
     def convert_value(v):
-        if isinstance(
+        if isinstance(v, dict):
+            return {k: convert_value(val) for k, val in v.items()}
+        elif isinstance(v, list):
+            return [convert_value(item) for item in v]
+        elif isinstance(v, (str, bool)):
+            return v
+        elif isinstance(
             v,
             (
                 np.int_,
@@ -410,6 +423,50 @@ def prepare_metrics_for_json(metrics_list: List[Dict[str, Any]]) -> List[Dict[st
             return float(v)
         elif isinstance(v, np.ndarray):
             return v.tolist()
-        return v
+        return str(v)
 
-    return [{k: convert_value(v) for k, v in epoch_metrics.items()} for epoch_metrics in metrics_list]
+    return [
+        {outer_k: convert_value(inner_dict) for outer_k, inner_dict in epoch_metrics.items()}
+        for epoch_metrics in metrics_list
+    ]
+
+
+def safe_extend(output: dict[str, Any], lst: list[Any], key: str, warn: bool = False, error: bool = False) -> None:
+    if key in output:
+        if isinstance(output[key], Tensor):
+            lst.extend(output[key].detach().cpu().numpy().tolist())
+        elif isinstance(output[key], ndarray):
+            lst.extend(output[key].tolist())
+        elif isinstance(output[key], list):
+            lst.extend(output[key])
+        else:
+            raise TypeError(f"Expected output[{key}] to be a Tensor, ndarray, or list, got {type(output[key])}")
+
+    else:
+        if error:
+            raise KeyError(
+                f"Key '{key}' not found in output. Cannot extend list. Available keys: {list(output.keys())}"
+            )
+        if warn:
+            print_warning(console, f"Key '{key}' not found in output. Skipping extension.")
+            return
+
+
+def ensure_dir(path: Path) -> Path:
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def get_correct_cmam_dataset_selected_patterns(condition: Literal["congruent", "incongruent"], cmam) -> str:
+    assert condition in [
+        "congruent",
+        "incongruent",
+    ], f"Invalid condition: {condition}. Must be 'congruent' or 'incongruent'."
+    input_modalities = [str(m)[0] for m in cmam.input_modalities]
+    target_modality = str(cmam.target_modality)[0]
+    pattern_inputs = input_modalities + ([target_modality] if condition == "congruent" else [])
+    pattern = "".join(sorted(pattern_inputs, key=lambda x: (len(x), x))).lower()
+    cmam_msg = "-".join([str(m) for m in cmam.input_modalities]) + f" -> {cmam.target_modality}"
+    # print_debug(console, f"[{condition.title()}] Pattern for C-MAM {cmam_msg}: {pattern}")
+    print_info(console, f"[{condition.title()}] Pattern for C-MAM {cmam_msg}: {pattern}")
+    return pattern

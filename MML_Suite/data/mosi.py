@@ -1,14 +1,16 @@
 import pickle
 from os import PathLike
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
+import numpy as np
 import torch
 from data.base_dataset import MultimodalBaseDataset
 from experiment_utils.logging import get_logger
 from modalities import Modality, add_modality
 from torch.nn.utils.rnn import pad_sequence
-
+from experiment_utils.printing import get_console
+console = get_console()
 logger = get_logger()
 
 add_modality("video")
@@ -38,11 +40,13 @@ class MultimodalSentimentDataset(MultimodalBaseDataset):
         *,
         missing_patterns: Optional[Dict[str, Dict[str, float]]] = None,
         selected_patterns: Optional[List[str]] = None,
+        missing_strategy: Literal["zero", "noise"] = "zero",
         labels_key: str = "classification_labels",
         aligned: bool = False,
         length: Optional[int] = None,
         num_classes: Optional[int] = None,
         batch_size: int = 1,
+        **kwargs
     ) -> None:
         """
         Initialize the Multimodal Sentiment Dataset.
@@ -69,19 +73,29 @@ class MultimodalSentimentDataset(MultimodalBaseDataset):
             "v": {Modality.AUDIO: 0.0, Modality.TEXT: 0.0, Modality.VIDEO: 1.0},
         }
 
+        modality_stats = {
+            Modality.AUDIO: {"mean": 0.6085, "std": 11.3582},
+            Modality.VIDEO: {"mean": -0.2222, "std": 1.3391},
+            Modality.TEXT: {"mean": 0.059, "std": 0.3493},
+        }
+
         # Override number of classes if specified
         if num_classes is not None:
             self.NUM_CLASSES = num_classes
 
         super().__init__(
-            split=split, selected_patterns=selected_patterns, missing_patterns=m_patterns, batch_size=batch_size
+            split=split,
+            selected_patterns=selected_patterns,
+            missing_patterns=m_patterns,
+            batch_size=batch_size,
+            modality_stats=modality_stats,
+            missing_strategy=missing_strategy,
         )
 
         self.data_fp = Path(data_fp)
         self.aligned = aligned
         self.length = length if aligned else None
         self.labels_key = labels_key
-
         # Process target modality
         if isinstance(target_modality, str):
             target_modality = Modality.from_str(target_modality)
@@ -96,6 +110,7 @@ class MultimodalSentimentDataset(MultimodalBaseDataset):
         # Load and validate data
         self.data = self._load_data(labels_key)
         self.num_samples = len(self.data["label"])
+        self.labels = self.get_labels()
         # Set up pattern-specific indices for validation/test
         if split != "train":
             self.pattern_indices = {pattern: list(range(self.num_samples)) for pattern in self.selected_patterns}
@@ -108,6 +123,17 @@ class MultimodalSentimentDataset(MultimodalBaseDataset):
             f"\n  Samples: {self.num_samples}"
             f"\n  Patterns: {', '.join(self.selected_patterns)}"
         )
+
+    def get_labels(self) -> np.ndarray:
+        """
+        Get the labels from the dataset.
+
+        Returns:
+            np.ndarray: Array of labels.
+        """
+        if "label" not in self.data:
+            raise KeyError(f"Labels key 'labels' not found in data, available keys: {list(self.data.keys())}")
+        return self.data["label"].numpy()
 
     def _load_data(self, labels_key: str) -> Dict[str, torch.Tensor]:
         """
@@ -160,6 +186,8 @@ class MultimodalSentimentDataset(MultimodalBaseDataset):
         Returns:
             int: Number of samples.
         """
+        # Always use original patterns for length calculation to maintain DataLoader consistency
+        # Temporary patterns don't change the dataset length - they just change what patterns are returned
         return self.num_samples if self.split == "train" else self.num_samples * len(self.selected_patterns)
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
@@ -180,8 +208,8 @@ class MultimodalSentimentDataset(MultimodalBaseDataset):
 
         sample = {
             "label": self.data["label"][sample_idx],
-            "pattern_name": pattern_name,
-            "missing_index": {},
+            "pattern_names": pattern_name,
+            # "missing_index": {},
             "sample_idx": sample_idx,
             **_data,
         }
@@ -209,7 +237,7 @@ class MultimodalSentimentDataset(MultimodalBaseDataset):
         Returns:
             Dict[str, Any]: Collated batch of samples.
         """
-        return self._collate_eval_batch(batch) if self.split != "train" else self._collate_train_batch(batch)
+        return self._collate_train_batch(batch)
 
     def _collate_train_batch(self, batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         """
@@ -223,13 +251,25 @@ class MultimodalSentimentDataset(MultimodalBaseDataset):
         """
         collated = {
             "label": torch.stack([b["label"] for b in batch]),
-            "pattern_names": [b["pattern_name"] for b in batch],
-            "missing_index": [b[""] for b in batch],
+            "pattern_names": [b["pattern_names"] for b in batch],
+            # "missing_index": [b["missing_index"] for b in batch],
+            "sample_idx": [b["sample_idx"] for b in batch],
         }
 
         for mod_enum in self.AVAILABLE_MODALITIES.values():
             sequences = [b.get(mod_enum) for b in batch if mod_enum in b]
             collated[mod_enum] = pad_sequence(sequences, batch_first=True, padding_value=0) if sequences else None
+            collated[f"{mod_enum}_original"] = pad_sequence(
+                [b.get(f"{mod_enum}_original") for b in batch if f"{mod_enum}_original" in b],
+                batch_first=True,
+                padding_value=0,
+            ) if f"{mod_enum}_original" in batch[0] else None
+            collated[f"{mod_enum}_reverse"] = pad_sequence(
+                [b.get(f"{mod_enum}_reverse") for b in batch if f"{mod_enum}_reverse" in b],
+                batch_first=True,
+                padding_value=0,
+            ) if f"{mod_enum}_reverse" in batch[0] else None
+            collated[f"{mod_enum}_missing_index"] = torch.stack([b.get(f"{mod_enum}_missing_index") for b in batch if f"{mod_enum}_missing_index" in b])
 
         return collated
 
@@ -245,7 +285,7 @@ class MultimodalSentimentDataset(MultimodalBaseDataset):
         """
         pattern_groups = {}
         for b in batch:
-            pattern = b["pattern_name"]
+            pattern = b["pattern_names"]
             pattern_groups.setdefault(pattern, []).append(b)
 
         return {pattern: self._collate_train_batch(group) for pattern, group in pattern_groups.items()}

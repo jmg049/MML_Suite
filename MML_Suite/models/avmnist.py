@@ -7,7 +7,7 @@ import torch
 from data.avmnist import AVMNIST as AVMNISTDataset
 from experiment_utils.loss import LossFunctionGroup
 from experiment_utils.metric_recorder import MetricRecorder
-from experiment_utils.printing import get_console
+from experiment_utils.printing import get_console, print_info
 from experiment_utils.utils import safe_detach
 from modalities import Modality
 from models.conv import ConvBlock, ConvBlockArgs
@@ -58,7 +58,7 @@ class MNISTAudio(Module):
             conv_batch_norm (bool): Whether to use batch normalization.
             max_pool_kernel_size (Union[int, Tuple[int, int]]): Kernel size for max pooling.
         """
-        super().__init__()
+        super(MNISTAudio, self).__init__()
         conv_block_one = ConvBlock(
             conv_block_one_args=conv_block_one_one_args,
             conv_block_two_args=conv_block_one_two_args,
@@ -255,16 +255,13 @@ class AVMNIST(Module, MultimodalMonitoringMixin):
         Returns:
             Tensor: Logits for classification.
         """
-        assert not all((A is None, I is None)), "At least one of A, I must be provided"
-        assert not all([is_embd_A, is_embd_I]), "Cannot have all embeddings as True"
-
         A = A if A is not None else torch.zeros(I.size(0), self.embd_size_A)
         I = I if I is not None else torch.zeros(A.size(0), self.embd_size_I)
 
         audio = self.audio_encoder(A) if not is_embd_A else A
         image = self.image_encoder(I) if not is_embd_I else I
         fused = self.fusion_fn((audio, image))
-        return self.net(fused)
+        return self.net(fused), fused
 
     def train_step(
         self,
@@ -294,10 +291,9 @@ class AVMNIST(Module, MultimodalMonitoringMixin):
             batch["labels"].to(device),
             batch["pattern_name"],
         )
-
         self.train()
         optimizer.zero_grad()
-        logits = self.forward(A=A, I=I)
+        logits, _ = self.forward(A=A, I=I)
         loss = loss_functions(logits, labels)["total_loss"]
         loss.backward()
         optimizer.step()
@@ -316,6 +312,8 @@ class AVMNIST(Module, MultimodalMonitoringMixin):
         device: torch.device,
         metric_recorder: MetricRecorder,
         return_test_info: bool = False,
+        **kwargs,
+
     ) -> Dict[str, Any]:
         """
         Perform a validation step.
@@ -332,19 +330,29 @@ class AVMNIST(Module, MultimodalMonitoringMixin):
         """
         self.eval()
         with torch.no_grad():
-            A, I, labels, miss_type = (
+            A, I, labels, miss_type, sample_ids = (
                 batch[Modality.AUDIO].to(device).float(),
                 batch[Modality.IMAGE].to(device).float(),
                 batch["labels"].to(device),
                 batch["pattern_name"],
+                batch["sample_idx"],
             )
 
-            logits = self.forward(A=A, I=I)
+            audio_embeddings = self.audio_encoder(A)
+            image_embeddings = self.image_encoder(I)
+            audio_embeddings = safe_detach(audio_embeddings)
+            image_embeddings = safe_detach(image_embeddings)
+
+            embeddings = {
+                "audio": audio_embeddings,
+                "image": image_embeddings,
+            }
+
+            logits, fused = self.forward(A=A, I=I)
             loss = loss_functions(logits, labels)["total_loss"]
             predictions = softmax(logits, dim=1).argmax(dim=1).detach().cpu().numpy()
             labels = labels.detach().cpu().numpy()
             miss_type = np.array(miss_type)
-
             metric_recorder.update_group_all(
                 group_name="classification", predictions=predictions, targets=labels, m_types=miss_type
             )
@@ -353,60 +361,29 @@ class AVMNIST(Module, MultimodalMonitoringMixin):
                 return {
                     "loss": loss.item(),
                     "predictions": predictions,
+                    "preds": predictions,
                     "labels": labels,
-                    "miss_types": miss_type,
+                    "miss_type": miss_type,
                     "logits": safe_detach(logits),
                     "targets": labels,
+                    "sample_ids": sample_ids,
+                    "ground_truth_logits": safe_detach(logits),
+                    "ground_truth_embeddings": embeddings,
+                    "observed_embeddings": fused,
                 }
 
         return {
             "loss": loss.item(),
             "logits": safe_detach(logits),
             "predictions": predictions,
+            "preds": predictions,
             "targets": labels,
             "miss_type": miss_type,
+            "sample_ids": sample_ids,
+            "ground_truth_logits": safe_detach(logits),
+            "ground_truth_embeddings": embeddings,
+            "observed_embeddings": fused,
         }
-
-    def get_embeddings(self, dataloader: DataLoader, device: torch.device) -> Dict[Modality, np.ndarray]:
-        """
-        Extract embeddings from the model for a given dataloader.
-
-        Args:
-            dataloader (DataLoader): DataLoader for extracting embeddings.
-            device (torch.device): Device to perform computations.
-
-        Returns:
-            Dict[Modality, np.ndarray]: Extracted embeddings for audio and image.
-        """
-        console.print("Getting embeddings...")
-        embeddings = defaultdict(list)
-        self.to(device)
-        self.eval()
-
-        for batch in dataloader:
-            with torch.no_grad():
-                A, I, miss_type = (
-                    batch[Modality.AUDIO],
-                    batch[Modality.IMAGE],
-                    batch["pattern_name"],
-                )
-
-                # Filter to full modality availability
-                miss_type = np.array(miss_type)
-                A = A[miss_type == AVMNISTDataset.get_full_modality()]
-                I = I[miss_type == AVMNISTDataset.get_full_modality()]
-
-                A = A.to(device).float()
-                I = I.to(device).float()
-
-                audio_embedding = self.audio_encoder(A)
-                image_embedding = self.image_encoder(I)
-
-                embeddings[Modality.AUDIO].append(safe_detach(audio_embedding, to_np=True))
-                embeddings[Modality.IMAGE].append(safe_detach(image_embedding, to_np=True))
-                embeddings["label"] += batch["labels"]
-
-        return embeddings
 
     def get_encoder(self, modality: Modality) -> Module:
         match modality:

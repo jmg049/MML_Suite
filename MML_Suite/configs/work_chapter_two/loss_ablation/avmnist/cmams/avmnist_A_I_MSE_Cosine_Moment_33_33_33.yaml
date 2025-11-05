@@ -1,0 +1,240 @@
+!CMAMConfig
+experiment: !ExperimentConfig
+  name: "AVMNIST C-MAM Audio to Image Baseline MSE_Cosine_Moment_33_33_33"
+  device: "cuda"
+  train_print_interval_epochs: 1
+  validation_print_interval_epochs: 1
+  is_train: true
+  is_test: true
+
+model: !ModelConfig
+  name: "AVMNIST"
+  model_type: "AVMNIST"
+  pretrained_path: $EXP_PATH/wch1/AVMNIST_Multimodal_Baseline_Training/models/{run_id}/best.pth
+  audio_encoder: !MNISTAudio
+    conv_block_one_one_args: !ConvBlockArgs
+      conv_one_in: 1
+      conv_one_out: 32
+    conv_block_one_two_args: !ConvBlockArgs
+      conv_one_in: 32
+      conv_one_out: 32
+    conv_batch_norm: True
+    conv_block_two_one_args: !ConvBlockArgs
+      conv_one_in: 32
+      conv_one_out: 64
+    conv_block_two_two_args: !ConvBlockArgs
+      conv_one_in: 64
+      conv_one_out: 64
+    conv_batch_norm: True
+    hidden_dim: 64
+  image_encoder: !MNISTImage
+    conv_block_one_one_args: !ConvBlockArgs
+      conv_one_in: 1
+      conv_one_out: 32
+    conv_block_one_two_args: !ConvBlockArgs
+      conv_one_in: 32
+      conv_one_out: 64
+    conv_block_two_one_args: !ConvBlockArgs
+      conv_one_in: 64
+      conv_one_out: 64
+    conv_block_two_two_args: !ConvBlockArgs
+      conv_one_in: 64
+      conv_one_out: 64
+    hidden_dim: 128
+    conv_batch_norm: True
+  hidden_dim: 128
+  dropout: 0.5
+  fusion_fn: "concat"
+
+cmam: !ModelConfig
+  name: "Simple_CMAM"
+  model_type: "Simple_CMAM"
+  target_modality: !Modality image
+  load_pretrained_encoder_state_for: []
+  input_modalities:
+    - !Modality audio
+  association_network: !AssociationNetwork
+    input_size: 64
+    hidden_size: 64
+    output_size: 128
+    dropout: 0.4
+    batch_norm: True
+
+training:
+  epochs: 20
+  early_stopping: true
+  early_stopping_patience: 10
+  num_modalities: 2
+  optimizer: !Optimizer
+    name: "Adam"
+    default_kwargs:
+      lr: 0.001
+      weight_decay: 0.0
+  loss_functions: !LossFunctionGroup
+    cmam: 
+      loss_name: "cmam"
+      loss_kwargs: {
+
+        cosine_weight: 0.33,
+        mse_weight: 0.33,
+        mae_weight: 0.0,
+        mmd_weight: 0.0,
+        moment_weight: 0.33,
+        num_moments: 2,
+        cls_weight: 0.0
+      
+      }
+      weight: 1.0
+
+data: !DataConfig
+  use_collate_fn: true
+  datasets:
+    train: !DatasetConfig
+      dataset: "AVMNIST"
+      data_fp: "$DATA/avmnist/train_subset.csv"
+      split: "train"
+      target_modality: !Modality "MULTIMODAL"
+      batch_size: 128
+
+      shuffle: true
+      missing_patterns: !MissingPatternConfig
+        modalities:
+          !Modality audio: !ModalityConfig
+            missing_rate: 0.0
+          !Modality image: !ModalityConfig
+            missing_rate: 0.0
+        selected_patterns: ["ai"]
+    validation: !DatasetConfig
+      dataset: "AVMNIST"
+      data_fp: "$DATA/avmnist/validation_subset.csv"
+      split: "valid"
+      target_modality: !Modality "MULTIMODAL"
+      shuffle: true
+      batch_size: 128
+      missing_patterns: !MissingPatternConfig
+        modalities:
+          !Modality audio: !ModalityConfig
+            missing_rate: 0.0
+          !Modality image: !ModalityConfig
+            missing_rate: 0.0
+        selected_patterns: ["ai"]
+    test: !DatasetConfig
+      dataset: "AVMNIST"
+      data_fp: "$DATA/avmnist/test_subset.csv"
+      split: "test"
+      target_modality: !Modality "MULTIMODAL"
+      shuffle: true
+      batch_size: 128
+      missing_patterns: !MissingPatternConfig
+        modalities:
+          !Modality audio: !ModalityConfig
+            missing_rate: 0.0
+          !Modality image: !ModalityConfig
+            missing_rate: 0.0
+        selected_patterns: ["ai"]
+
+    embeddings: !DatasetConfig
+      dataset: "AVMNIST"
+      data_fp: "$DATA/avmnist/test_subset.csv"
+      split: "test"
+      target_modality: !Modality "MULTIMODAL"
+      shuffle: true
+      batch_size: 128 
+      missing_patterns: !MissingPatternConfig
+        modalities:
+          !Modality audio: !ModalityConfig
+            missing_rate: 0.0
+          !Modality image: !ModalityConfig
+            missing_rate: 0.0
+        selected_patterns: ["ai"]
+
+metrics:
+  metrics:
+    accuracy:
+      function: "sklearn.metrics.accuracy_score"
+      kwargs: {}
+    balanced_accuracy:
+      function: "sklearn.metrics.balanced_accuracy_score"
+      kwargs: {}
+    f1_macro:
+      function: "sklearn.metrics.f1_score"
+      kwargs:
+        average: "macro"
+        zero_division: 0
+    f1_micro:
+      function: "sklearn.metrics.f1_score"
+      kwargs:
+        average: "micro"
+        zero_division: 0
+    f1_weighted:
+      function: "sklearn.metrics.f1_score"
+      kwargs:
+        average: "weighted"
+        zero_division: 0
+    precision_macro:
+      function: "sklearn.metrics.precision_score"
+      kwargs:
+        average: "macro"
+        zero_division: 0
+    precision_micro:
+      function: "sklearn.metrics.precision_score"
+      kwargs:
+        average: "micro"
+        zero_division: 0
+    precision_weighted:
+      function: "sklearn.metrics.precision_score"
+      kwargs:
+        average: "weighted"
+        zero_division: 0
+    recall_macro:
+      function: "sklearn.metrics.recall_score"
+      kwargs:
+        average: "macro"
+        zero_division: 0
+    recall_micro: 
+      function: "sklearn.metrics.recall_score"
+      kwargs:
+        average: "micro"
+        zero_division: 0
+    recall_weighted:
+      function: "sklearn.metrics.recall_score"
+      kwargs:
+        average: "weighted"
+        zero_division: 0
+    ConfusionMatrix:
+      function: "sklearn.metrics.confusion_matrix"
+      kwargs:
+        labels: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+    mae:
+      function: "sklearn.metrics.mean_absolute_error"
+      kwargs: {}
+    mse:
+      function: "sklearn.metrics.mean_squared_error"
+      kwargs: {}
+    cosine:
+      function: "metrics.cosine_similarity"
+      kwargs: {}
+  groups:
+    classification: [ "accuracy", "balanced_accuracy", "f1_macro", "f1_micro", "f1_weighted", "precision_macro", "precision_micro", "precision_weighted", "recall_macro", "recall_micro", "recall_weighted"]
+    reconstruction: ["mae", "mse", "cosine"]
+
+logging:
+  log_path: "$EXP_PATH/wch2/{experiment_name}/logs/{run_id}"
+  model_output_path: "$EXP_PATH/wch2/{experiment_name}/models/{run_id}"
+  metrics_path: "$EXP_PATH/wch2/{experiment_name}/metrics/{run_id}"
+  save_metric: "loss"
+  monitor_path: "$EXP_PATH/wch2/{experiment_name}/monitoring/{run_id}"
+
+monitoring:
+  enabled: false
+  gradient_interval: 100
+  activation_interval: 100
+  weight_interval: 200
+  buffer_size: 1000
+  compression: "gzip"
+  compression_opts: 4
+  enable_gradient_tracking: true
+  enable_activation_tracking: true
+  enable_weight_tracking: true
+  enable_layer_convergence: true
+  enable_information_flow: false

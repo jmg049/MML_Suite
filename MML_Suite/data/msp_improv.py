@@ -36,7 +36,7 @@ class MSACrossFoldDataset(MultimodalBaseDataset):
         labels_key: str = "classification_labels",
         num_classes: Optional[int] = None,
         batch_size: int = 1,
-        cv_no: int = 0,
+        cv_no: int = 1,
         A_type: Literal["comparE", "comparE_raw"] = "comparE_raw",
         V_type: Literal["denseface"] = "denseface",
         T_type: Literal["bert_large"] = "bert_large",
@@ -75,28 +75,42 @@ class MSACrossFoldDataset(MultimodalBaseDataset):
         # Process target modality
         if isinstance(target_modality, str):
             target_modality = Modality.from_str(target_modality)
-        assert isinstance(target_modality, Modality), (
-            f"Invalid modality provided, must be a Modality instance, not {type(target_modality)}"
-        )
-        assert target_modality in self.AVAILABLE_MODALITIES.values() or target_modality == Modality.MULTIMODAL, (
-            f"Invalid target modality provided, must be one of {list(self.AVAILABLE_MODALITIES.values())}"
-        )
+        assert isinstance(
+            target_modality, Modality
+        ), f"Invalid modality provided, must be a Modality instance, not {type(target_modality)}"
+        assert (
+            target_modality in self.AVAILABLE_MODALITIES.values() or target_modality == Modality.MULTIMODAL
+        ), f"Invalid target modality provided, must be one of {list(self.AVAILABLE_MODALITIES.values())}"
         self.target_modality = target_modality
 
         self.cv_no = cv_no
         self.data = self._load_data()
         self.num_samples = len(self.labels)
+
+        if len(self.labels) == 0:
+            raise ValueError(f"No samples found for split '{split}' in dataset at {self.data_fp}")
+
         # Set up pattern-specific indices for validation/test
         if split != "train":
             self.pattern_indices = {pattern: list(range(self.num_samples)) for pattern in self.selected_patterns}
         self.masks = self._initialise_missing_masks(self.missing_patterns, len(self))
-
+        self.manual_collate = True
         logger.info(
             f"Initialized {self.__class__.__name__} dataset:"
             f"\n  Split: {split}"
             f"\n  Target Modality: {target_modality}"
             f"\n  Samples: {self.num_samples}"
             f"\n  Patterns: {', '.join(self.selected_patterns)}"
+            f"\n  CV No: {self.cv_no}"
+        )
+
+        console.print(
+            f"[bold green]Initialized {self.__class__.__name__} dataset:[/bold green]\n"
+            f"  Split: {split}\n"
+            f"  Target Modality: {target_modality}\n"
+            f"  Samples: {self.num_samples}\n"
+            f"  Patterns: {', '.join(self.selected_patterns)}\n"
+            f"  CV No: {self.cv_no}"
         )
 
     def _load_data(self):
@@ -136,26 +150,28 @@ class MSACrossFoldDataset(MultimodalBaseDataset):
 
         pattern_name, sample_idx = _data.pop("pattern"), _data.pop("sample_idx")
         self.current_pattern = pattern_name
-
         int2name = self.int2name[sample_idx]
-        if self.name == "IEMOCAP":
+        if self.name.lower()     == "IEMOCAP".lower():
             int2name = int2name[0].decode()
-        label = torch.tensor(self.labels[sample_idx])
 
+        if self.name.lower() == "iemocap":
+            l = np.where(self.labels[sample_idx] == 1)
+            l = l[0]
+            label = torch.tensor(l)
+        else:
+            label = torch.tensor(self.labels[sample_idx])
         sample = {
             "label": label,
-            "pattern_name": pattern_name,
-            "missing_index": {},
+            "pattern_names": pattern_name,
             "sample_idx": sample_idx,
             **_data,
         }
-
         def _audio():
             audio = torch.from_numpy(self.all_A[int2name][()]).float()
             if self.A_type == "comparE" or self.A_type == "comparE_raw":
                 audio = self.normalize_on_utt(audio) if self.norm_method == "utt" else self.normalize_on_trn(audio)
 
-            return audio
+            return audio.float()
 
         modality_loaders = {
             "audio": (lambda: _audio(), Modality.AUDIO),
@@ -196,7 +212,9 @@ class MSACrossFoldDataset(MultimodalBaseDataset):
         Returns:
             Dict[str, Any]: Collated batch of samples.
         """
-        return self._collate_eval_batch(batch) if self.split != "train" else self._collate_train_batch(batch)
+        batch = self._collate_train_batch(batch)
+        return batch
+        # return self._collate_eval_batch(batch) if self.split != "train" else self._collate_train_batch(batch)
 
     def _collate_train_batch(self, batch: list[dict[str, Any]]) -> dict[str, Any]:
         """
@@ -210,13 +228,25 @@ class MSACrossFoldDataset(MultimodalBaseDataset):
         """
         collated = {
             "label": torch.stack([b["label"] for b in batch]),
-            "pattern_names": [b["pattern_name"] for b in batch],
-            "missing_index": [b[""] for b in batch],
+            "pattern_names": [b["pattern_names"] for b in batch],
+            "sample_idx": torch.tensor([b["sample_idx"] for b in batch]),
         }
-
         for mod_enum in self.AVAILABLE_MODALITIES.values():
             sequences = [b.get(mod_enum) for b in batch if mod_enum in b]
             collated[mod_enum] = pad_sequence(sequences, batch_first=True, padding_value=0) if sequences else None
+            collated[f"{mod_enum}_original"] = pad_sequence(
+                [b.get(f"{mod_enum}_original") for b in batch if f"{mod_enum}_original" in b],
+                batch_first=True,
+                padding_value=0,
+            ) if f"{mod_enum}_original" in batch[0] else None
+            collated[f"{mod_enum}_reverse"] = pad_sequence(
+                [b.get(f"{mod_enum}_reverse") for b in batch if f"{mod_enum}_reverse" in b],
+                batch_first=True,
+                padding_value=0,
+            ) if f"{mod_enum}_reverse" in batch[0] else None
+
+            collated[f"{mod_enum}_missing_index"] = torch.stack([b.get(f"{mod_enum}_missing_index") for b in batch if f"{mod_enum}_missing_index" in b])
+
 
         return collated
 
@@ -235,7 +265,9 @@ class MSACrossFoldDataset(MultimodalBaseDataset):
             pattern = b["pattern_name"]
             pattern_groups.setdefault(pattern, []).append(b)
 
-        return {pattern: self._collate_train_batch(group) for pattern, group in pattern_groups.items()}
+        x=  {pattern: self._collate_train_batch(group) for pattern, group in pattern_groups.items()}
+
+        return x
 
 
 class IEMOCAP(MSACrossFoldDataset):

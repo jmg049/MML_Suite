@@ -14,8 +14,7 @@ from rich.progress import BarColumn, Column, Progress, SpinnerColumn, TaskID, Te
 from rich.table import Table
 from rich.text import Text
 from rich.theme import Theme
-
-
+DEBUG = False  # Global debug flag
 @dataclass
 class TaskInfo:
     """Store task information including ID and colors"""
@@ -228,30 +227,24 @@ class EnhancedConsole:
         if confusion_table:
             self.console.print(confusion_table)
 
-    def display_validation_metrics(self, metrics: Dict[str, Dict[str, Any]]):
+    def display_validation_metrics(self, metrics: Dict[str, Dict[str, Any]], skip_conditions: Optional[list[str]] = None):
         """Display validation metrics grouped by condition"""
 
         # for group, group_data in metrics.items():
         grouped_metrics = defaultdict(dict)
 
         loss_metrics = {}
-        #     confusion_table = None
-
-        #     self.console.print(
-        #         f"Metrics for group: {group.title()}",
-        #     )
-
-        #     if not isinstance(group_data, dict):
-        #         continue
-
+   
         for key, value in metrics.items():
-            if key == "loss":
+            if key == "loss" or key  in ["cosine", "mse", "mae", "mmd", "moments_loss"]:
                 loss_metrics[key] = value
                 continue
 
             match = re.match(r"(.+?)_([A-Z]+)$", key)
             if match:
                 metric_name, condition = match.groups()
+                if skip_conditions and (condition.lower() in skip_conditions or condition.upper() in skip_conditions):
+                    continue
                 grouped_metrics[condition][metric_name] = value
 
         tables = []
@@ -307,6 +300,49 @@ class EnhancedConsole:
 
     def stop_progress(self):
         self.progress_manager.stop()
+
+# Logging/console printing helpers
+
+def print_debug(console, message: str) -> None:
+    global DEBUG
+    if DEBUG:
+        console.print(f"[blue][DEBUG][/]: {message}")
+
+def print_info(console, message: str) -> None:
+    console.print(f"[cyan][INFO][/]: {message}")
+
+
+def print_warning(console, message: str) -> None:
+    console.print(f"[yellow][WARNING][/]: {message}")
+
+
+def print_success(console, message: str) -> None:
+    console.print(f"[green][SUCCESS][/]: {message}")
+
+
+def print_error(console, message: str) -> None:
+    console.print(f"[red][ERROR][/]: {message}")
+
+
+def print_metric_summary(console: EnhancedConsole, epoch: int, metrics: dict[str, float], split: str, skip_conditions: Optional[list[str]] = None) -> None:
+    console.rule(f"Metrics Summary for Epoch {epoch} - {split.upper()}")
+    
+    console.display_validation_metrics(
+        metrics, skip_conditions=skip_conditions
+    )
+
+
+def log_epoch_time(console, logger, client_id: int, epoch: int, time_sec: float) -> None:
+    msg = f"Client {client_id} - Epoch {epoch} completed in {int(time_sec)} seconds"
+    print_info(console, msg)
+    logger.info(msg)
+
+
+def log_total_time(console, logger, client_id: int, total_time: float) -> None:
+    msg = f"Client {client_id} - Total training time: {int(total_time)} seconds"
+    print_success(console, msg)
+    logger.info(msg)
+
 
 
 # Singleton management

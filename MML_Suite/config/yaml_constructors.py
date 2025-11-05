@@ -1,4 +1,6 @@
 import yaml
+from config.federated_configs.federated_data_config import FedDataConfig
+from fed import ClientSelectionStrategy, Aggregation, DistributionStrategy, DataSplitType, FedDataCondition, FedLearningType
 from models.kinetics_sounds import KineticsSoundsAudioEncoder, KineticsSoundsVideoEncoder
 from config.cmam_config import CMAMConfig
 from config.data_config import DataConfig, DatasetConfig, ModalityConfig, MissingPatternConfig
@@ -6,7 +8,7 @@ from config.experiment_config import ExperimentConfig
 from config.logging_config import LoggingConfig
 from config.metric_config import MetricConfig
 from config.model_config import ModelConfig
-from config.multimodal_training_config import StandardMultimodalConfig
+from config.multimodal_training_config import StandardMultimodalConfig, TrainingConfig
 from config.optimizer_config import OptimizerConfig, ParameterGroupConfig
 from experiment_utils.logging import get_logger
 from experiment_utils.loss import LossFunctionGroup
@@ -25,6 +27,7 @@ from models.msa.self_mm import AuViSubNet, Self_MM
 from models.msa.utt_fusion import UttFusionModel
 from models.msa.networks.transformer import Transformer
 from models.cmams import AssociationNetwork, InputEncoders
+from config.federated_configs import FederatedExperimentConfig, FederatedConfig
 
 logger = get_logger()
 
@@ -55,14 +58,28 @@ register_constructor("!DataConfig", DataConfig, from_dict=True, deep=True)
 register_constructor("!MetricConfig", MetricConfig, from_dict=True)
 register_constructor("!LoggingConfig", LoggingConfig)
 register_constructor("!ModelConfig", ModelConfig, from_dict=True)
-register_constructor("!ExperimentConfig", ExperimentConfig)
+register_constructor("!ExperimentConfig", ExperimentConfig, from_dict=True)
 register_constructor("!StandardConfig", StandardMultimodalConfig)
+
+
+register_constructor("!FederatedExperimentConfig", FederatedExperimentConfig)
+register_constructor("!FedConfig", FederatedConfig, from_dict=True, deep=True)
+register_constructor("!ClientSelection", ClientSelectionStrategy)
+register_constructor("!Aggregation", Aggregation, from_dict=True, deep=True)
+register_constructor("!FedDataConfig", FedDataConfig, from_dict=True, deep=True)
+
+
 register_constructor("!ParameterGroupConfig", ParameterGroupConfig)
 register_constructor("!Optimizer", OptimizerConfig, from_dict=True, deep=True)
 register_constructor("!CMAMConfig", CMAMConfig, deep=True)
 register_constructor("!AssociationNetwork", cls=AssociationNetwork, from_dict=True, deep=True)
 register_constructor("!InputEncoders", cls=InputEncoders, from_dict=True, deep=True)
 # Registering constructors for models and other components
+
+register_scalar_constructor("!DataSplitType", DataSplitType)
+register_scalar_constructor("!FedDataCondition", FedDataCondition)
+register_scalar_constructor("!FedLearningType", FedLearningType)
+
 register_scalar_constructor("!Modality", add_modality)
 register_constructor(
     "!MNISTAudio",

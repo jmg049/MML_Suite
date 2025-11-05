@@ -53,6 +53,7 @@ class MMIMDb(MultimodalBaseDataset):
         text_key: str = "features",
         labels_key: str = "genres",
         imdb_ids_key: str = "imdb_ids",
+        missing_strategy: Literal["noise", "zero"] = "zero",
         split_indices: Optional[List[int]] = None,
         _id: int = 1,
     ):
@@ -75,7 +76,20 @@ class MMIMDb(MultimodalBaseDataset):
             "i": {Modality.IMAGE: 1.0, Modality.TEXT: 0.0},  # Image only
             "t": {Modality.IMAGE: 0.0, Modality.TEXT: 1.0},  # Text only
         }
-        super().__init__(split=split, selected_patterns=selected_patterns, missing_patterns=m_patterns, _id=_id)
+
+        modality_stats = {
+            Modality.IMAGE: {"mean": 0.3381, "std": 0.9204},
+            Modality.TEXT: {"mean": -0.0009, "std": 0.0405},
+        }
+
+        super().__init__(
+            split=split,
+            selected_patterns=selected_patterns,
+            missing_patterns=m_patterns,
+            _id=_id,
+            missing_strategy=missing_strategy,
+            modality_stats=modality_stats,
+        )
 
         assert split in self.VALID_SPLITS, f"Invalid split provided, must be one of {self.VALID_SPLITS}"
 

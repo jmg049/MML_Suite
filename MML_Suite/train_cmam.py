@@ -2,6 +2,7 @@ import atexit
 import json
 import os
 import subprocess
+import sys
 import time
 import warnings
 from argparse import ArgumentParser
@@ -11,6 +12,7 @@ from typing import Any, Dict, List, Literal, Optional, Tuple
 
 import numpy as np
 import torch
+from train_multimodal import count_parameters
 from config.cmam_config import CMAMConfig
 from config.multimodal_training_config import StandardMultimodalConfig
 from config.resolvers import resolve_init_fn, resolve_model_name
@@ -29,6 +31,9 @@ from experiment_utils.monitoring import ExperimentMonitor
 from experiment_utils.printing import EnhancedConsole, get_console
 from experiment_utils.utils import (
     PARAMETER_SIZE_BYTES,
+    AccessError,
+    NestedDictAccess,
+    SafeDict,
     clean_checkpoints,
     gpu_memory,
     prepare_metrics_for_json,
@@ -115,6 +120,7 @@ def setup_dataloaders(config: StandardMultimodalConfig) -> Dict[str, DataLoader]
     console.print(f"Finished building dataloaders. Created: {list(dataloaders.keys())}")
 
     for split, loader in dataloaders.items():
+        console.print(f"Loader batch size {loader.batch_size}")
         dataset_size = len(loader.dataset)
         logger.debug(f"{split} dataset size: {dataset_size}")
         if split in ["train", "validation"]:
@@ -127,6 +133,8 @@ def setup_dataloaders(config: StandardMultimodalConfig) -> Dict[str, DataLoader]
 def setup_model_components(
     config: CMAMConfig,
     dataloaders: Optional[DataLoader | Dict[str, DataLoader]] = None,
+    fold:int = None,
+
 ) -> Tuple[
     MultimodalModelProtocol,
     MultimodalModelProtocol,
@@ -219,10 +227,18 @@ def setup_model_components(
         console.print("[bold yellow]![/] No scheduler")
 
     if config.model.pretrained_path:
-        logger.info(f"Loading pretrained model from {config.model.pretrained_path}")
-        console.print(f"Loading pretrained model from {config.model.pretrained_path}")
-        base_model.load_state_dict(torch.load(config.model.pretrained_path, weights_only=True)["model_state_dict"])
+        pt_path = config.model.pretrained_path
+        if fold:
+            model_path = config.model.pretrained_path.replace(f"models/{config.experiment.run_id}/", f"models/{config.experiment.run_id}/fold_{fold}/")
+            pt_path = model_path
 
+        logger.info(f"Loading pretrained model from {pt_path}")
+        console.print(f"[bold green] >> [/] Loading pretrained model from {pt_path}")
+        base_model.load_state_dict(torch.load(pt_path, weights_only=True, map_location="cpu")["model_state_dict"])
+
+    else:
+        console.print("No model weights provided")
+        exit(-1)
     if (
         "load_pretrained_encoder_state_for" in config.cmam.kwargs
         and len(config.cmam.kwargs["load_pretrained_encoder_state_for"]) > 0
@@ -236,10 +252,49 @@ def setup_model_components(
         cmam_model.load_encoder_state_for(data)
 
     elif config.cmam.pretrained_path:
-        logger.info(f"Loading pretrained model from {config.cmam.pretrained_path}")
-        console.print(f"Loading pretrained model from {config.cmam.pretrained_path}")
+        logger.info(f"Loading pretrained C-MAM model from {config.cmam.pretrained_path}")
+        console.print(f"Loading pretrained C-MAM model from {config.cmam.pretrained_path}")
         cmam_model.load_state_dict(torch.load(config.cmam.pretrained_path, weights_only=True)["model_state_dict"])
+    else:
+        # If no explicit C-MAM checkpoint path is provided and we're in test mode,
+        # try to find the checkpoint automatically
+        if not config.experiment.is_train:
+            logger.info("No explicit C-MAM checkpoint path provided. Attempting to find checkpoint automatically.")
+            console.print("[yellow]Warning:[/] No explicit C-MAM checkpoint path provided.")
+            console.print("[yellow]Will attempt to load checkpoint automatically during testing.[/]")
+            
+            # Try to find if there's a checkpoint available
+            temp_checkpoint_manager = CheckpointManager(
+                model_dir=config.logging.model_output_path,
+                save_metric=config.logging.save_metric,
+                mode="minimize" if config.logging.save_metric == "loss" else "maximize",
+                device=config.experiment.device,
+            )
+            try:
+                checkpoint_path = temp_checkpoint_manager.get_best_checkpoint()
+                if temp_checkpoint_manager.validate_checkpoint(checkpoint_path):
+                    logger.info(f"Found and validated C-MAM checkpoint at: {checkpoint_path}")
+                    console.print(f"[green]✓[/] Found C-MAM checkpoint: {checkpoint_path}")
+                    # Load it immediately to ensure consistency
+                    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+                    cmam_model.load_state_dict(checkpoint["model_state_dict"])
+                    console.print(f"[green]✓[/] Loaded C-MAM checkpoint for test-only mode")
+                    cmam_model.eval()  # Ensure model is in eval mode for testing
+                else:
+                    logger.warning(f"Found but failed to validate C-MAM checkpoint at: {checkpoint_path}")
+                    console.print(f"[red]✗[/] C-MAM checkpoint validation failed: {checkpoint_path}")
+            except FileNotFoundError as e:
+                logger.error(f"No C-MAM checkpoint found: {e}")
+                console.print("[red]Error:[/] No C-MAM checkpoint found. Model will use random weights!")
+                console.print("[red]This will likely produce incorrect evaluation results.[/]")
+                # The CheckpointManager.get_best_checkpoint() already provided recovery suggestions
+                raise RuntimeError(
+                    "C-MAM checkpoint is required for testing but was not found. "
+                    "Please ensure training was completed or provide explicit checkpoint path."
+                ) from e
 
+    console.print(f"> Loss Functions: {(criterion)}")
+    console.print(f"{type(criterion)}")
     return cmam_model, base_model, optimizer, criterion, scheduler, device, metric_recorder
 
 
@@ -273,11 +328,9 @@ def check_early_stopping(
         # No best metrics yet; current metrics are the best by default
         return True, True, 0
 
-    metric_value = val_metrics.get(target_metric, None)
-    best_value = best_metrics.get(target_metric, None)
+    metric_value = val_metrics.get("classification").get(target_metric, None)
+    best_value = best_metrics.get("classification").get(target_metric, None)
 
-    if metric_value is None or best_value is None:
-        raise ValueError(f"Metric '{target_metric}' not found in val_metrics or best_metrics.")
 
     # Check for improvement
     if (mode == "minimize" and metric_value < best_value - min_delta) or (
@@ -442,10 +495,18 @@ def validate_epoch(
     model.eval()
     start_time = time.time()
     losses = defaultdict(list)
-
+    targets = []
+    preds = []
+    logits = [] # gt logits from predictions with missing data
+    rec_logits = [] # logits from using reconstructed modalities in place of the missing data
+    miss_types = []
+    modality_logits = []
+    sample_ids = []
     console.start_task(task_name, total=len(val_loader), style="bright yellow")
+    start_time = time.time()
 
     with torch.no_grad():
+        console.print(f"Size of Loader: {len(val_loader)}")
         for batch in val_loader:
             validation_output = cmam.validation_step(
                 batch,
@@ -454,7 +515,27 @@ def validate_epoch(
                 metric_recorder=metric_recorder,
                 trained_model=model,
             )
+            validation_target = validation_output["targets"] if "targets" in validation_output else None
+            validation_pred = validation_output["predictions"]
+            validation_logits = validation_output["logits"] if "logits" in validation_output else None
+            validation_rec_logits = validation_output["rec_logits"] if "rec_logits" in validation_output else None
+            validation_miss_types = validation_output["miss_type"] if "miss_type" in validation_output else None
+            validation_modality_logits = validation_output["modality_logits"] if "modality_logits" in validation_output else None
+            validation_sample_ids = validation_output.get("sample_ids")
 
+            if validation_target is not None:
+                targets.append(validation_target)
+            preds.append(validation_pred)
+            if validation_logits is not None:
+                logits.append(validation_logits)
+            if validation_miss_types is not None:
+                miss_types.extend(validation_miss_types)
+            if validation_modality_logits is not None:
+                modality_logits.append(validation_modality_logits)
+            if validation_sample_ids is not None:
+                sample_ids.extend(validation_sample_ids)
+            if validation_rec_logits is not None:
+                rec_logits.append(validation_rec_logits)
             loss = validation_output["loss"]
             other_losses = validation_output.get("losses", None)
 
@@ -467,11 +548,22 @@ def validate_epoch(
             if monitor:
                 monitor.step()
             console.update_task(task_name, advance=1)
-    console.complete_task(task_name)
-
-    losses = {key: np.mean(value) for key, value in losses.items()}
     time_taken = time.time() - start_time
-    return losses["loss"], time_taken, losses
+    time_taken /= len(val_loader) if len(val_loader) != 0 else 1.0
+    time_taken = round(time_taken, 8)
+    console.complete_task(task_name)
+    if len(targets) > 0:
+        targets = np.concat(targets)
+    if len(preds) > 0:
+        preds = np.concat([safe_detach(p) for p in preds])
+    if len(logits) > 0:
+        logits = np.concat([safe_detach(l) for l in logits])
+    if len(rec_logits) > 0:
+        rec_logits = np.concat([safe_detach(l) for l in rec_logits])
+
+    
+    losses = {key: np.mean(value) for key, value in losses.items()}
+    return losses["loss"], time_taken, losses, (targets, preds, logits, miss_types, modality_logits, sample_ids, rec_logits)
 
 
 def _train_loop(
@@ -511,6 +603,7 @@ def _train_loop(
     best_metrics = None
     wait = 0
     console.start_task("Epoch", total=config.training.epochs)
+    console.print(loss_functions)
 
     for epoch in range(1, config.training.epochs + 1):
         if monitor:
@@ -533,13 +626,24 @@ def _train_loop(
         train_metrics["loss"] = train_loss
         experiment_data["metrics_history"]["train"].append(train_metrics.copy())
         experiment_data["timing_history"]["train"].append(train_time)
+
+
+        for l, l_value in train_loss_info.items():
+            if "losses" not in train_metrics:
+                train_metrics["losses"] = {}    
+            train_metrics["losses"][l] = l_value
+        
         for group in train_metrics:
             if isinstance(train_metrics[group], dict):
                 console.rule(f"Train - {group}")
                 console.display_validation_metrics(train_metrics[group])
+            else:
+                console.print(f"[bold green]{group}[/] - {round(train_metrics[group], 5)}")
+
+
 
         metric_recorder.reset()
-        val_loss, val_time, val_loss_info = validate_epoch(
+        val_loss, val_time, val_loss_info, _ = validate_epoch(
             cmam=cmam,
             model=model,
             val_loader=dataloaders["validation"],
@@ -552,7 +656,12 @@ def _train_loop(
         )
         val_metrics = metric_recorder.calculate_all_groups(epoch=epoch, loss=val_loss)
         val_metrics["loss"] = val_loss
-        val_metrics.update({k: np.mean(v) for k, v in val_loss_info.items()})
+
+        for l, l_value in val_loss_info.items():
+            if "losses" not in val_metrics:
+                val_metrics["losses"] = {}    
+            val_metrics["losses"][l] = l_value
+
         experiment_data["metrics_history"]["validation"].append(val_metrics.copy())
         experiment_data["timing_history"]["validation"].append(val_time)
 
@@ -565,7 +674,12 @@ def _train_loop(
             for loss_name in train_loss_info:
                 logger.debug(f"Logging {loss_name} loss")
                 train_value = train_loss_info[loss_name]
-                val_value = val_loss_info[loss_name]
+                try:
+                    val_value = val_loss_info[loss_name]
+                except KeyError as ke:
+                    console.print(ke)
+                    console.print(val_loss_info.keys())
+                    exit(-1)
                 metric_recorder.writer.add_scalars(
                     f"{loss_name} Loss", {"Train": train_value, "Validation": val_value}, epoch
                 )
@@ -624,6 +738,7 @@ def test(
     checkpoint_manager: CheckpointManager,
     experiment_data: Optional[Dict[str, Any]] = None,
     monitor: Optional[ExperimentMonitor] = None,
+    metrics_out_fmt: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Perform testing on the model using the specified data loaders.
@@ -641,7 +756,20 @@ def test(
     Returns:
         Dict[str, Any]: Metrics recorded during testing.
     """
-    checkpoint_manager.load_checkpoint(model=cmam, load_best=True)
+    # Load checkpoint for testing (but skip if already loaded in setup_model_components)
+    # Check if the model has already been loaded by seeing if weights are non-random
+    param_sum = sum(p.sum().item() for p in cmam.parameters())
+    if abs(param_sum) < 1e-6:  # Likely random initialization
+        logger.info("C-MAM model appears to have random weights, loading checkpoint...")
+        checkpoint_manager.load_checkpoint(model=cmam, load_best=True)
+    else:
+        logger.info("C-MAM model appears to already have loaded weights, skipping checkpoint loading.")
+    
+    # Validate model state for evaluation consistency
+    _validate_model_state_for_evaluation(cmam, model, device)
+    
+    # Set deterministic seeds for evaluation consistency
+    _set_deterministic_evaluation_seeds()
 
     for split_name, loader in dataloaders.items():
         if split_name in ["train", "validation", "embeddings"]:
@@ -651,7 +779,7 @@ def test(
         console.print(f"\n[bold cyan]Testing on {split_name} split[/]")
 
         with torch.no_grad():
-            test_loss, test_time, test_loss_info = validate_epoch(
+            test_loss, test_time, test_loss_info, (targets, preds, logits, miss_types, modality_logits, sample_ids, rec_logits) = validate_epoch(
                 cmam=cmam,
                 model=model,
                 val_loader=loader,
@@ -662,206 +790,174 @@ def test(
                 monitor=monitor,
                 task_name=f"Testing {split_name}",
             )
+
+        unique_masks = np.unique(miss_types)                 # e.g. ['av', 'a', 'v']
+        console.print(f"Unique miss types: {unique_masks}")
+
+
         metrics = metric_recorder.calculate_all_groups(loss=test_loss, skip_tensorboard=False)
 
         metrics.update({k: np.mean(v) for k, v in test_loss_info.items()})
         experiment_data["metrics_history"][split_name] = metrics
         experiment_data["timing_history"][split_name] = [test_time]
-        for group in metrics:
-            if isinstance(metrics[group], dict):
-                console.rule(f"Test - {group}")
-                console.display_validation_metrics(metrics[group])
+
+    if dataloaders.get("embeddings", None):
+        console.print("[bold cyan]Generating embeddings[/]")
+        out_fp = str(metrics_out_fmt)
+        checkpoint_manager.load_checkpoint(model=cmam, load_best=True)
+        cmam.get_embeddings(dataloader=dataloaders["embeddings"],device=device,  out_fp=out_fp, trained_model=model)
+
+    if metrics_out_fmt:
+        metrics_out_fmt = str(metrics_out_fmt)
+        targets_path = metrics_out_fmt.format(targ="targets")
+        preds_path = metrics_out_fmt.format(targ="preds")
+        logits_path = metrics_out_fmt.format(targ="logits")
+        rec_logits_path = metrics_out_fmt.format(targ="rec_logits")
+        miss_types_path = metrics_out_fmt.format(targ="miss_types")
+        timing = metrics_out_fmt.format(targ="params_timing")
+        timing = Path(timing).with_suffix(".txt")
+        os.makedirs(timing.parent, exist_ok=True)
+        with open(timing, "w+") as f:
+            parameter_count = sum(p.numel() for p in model.parameters() if p.requires_grad)
+            f.write(f"parameter_count: {parameter_count}\n")
+            f.write(f"test_time: {test_time}")
+            console.print(f"> Saved test timing ({test_time}s) to {timing}")
+
+        # console.print(f"Targets: {targets.shape}")
+
+
+        b_logits = defaultdict(list)
+        for batch_logits in modality_logits:
+            for m in batch_logits:
+                b_logits[m].append(batch_logits[m])
+        b_logits = {
+            k: np.concat(v) for k, v in b_logits.items()
+        }
+
+        for m, l in b_logits.items():
+            path = metrics_out_fmt.format(targ=f"{str(m).lower()}_logits")
+            print(path)
+            np.save(path,l)
+            console.print(f"> Saved logits to {path}")
+
+        np.save(targets_path, targets)
+        np.save(preds_path, preds)
+        np.save(logits_path, logits)
+        np.save(rec_logits_path, rec_logits)
+        # targets / ids -----------------------------------------------
+        fmt = str(metrics_out_fmt)                       # Path pattern
+
+        # np.save(fmt.format(targ=f"targets_{canonical}"), targets_algn)
+        # np.save(fmt.format(targ="sample_ids"),           order_ids)
+        # # logits per mask ---------------------------------------------
+        # for m, arr in aligned_logits.items():
+        #     np.save(fmt.format(targ=f"logits_{m}"), arr)
+        #     console.print(f"> Saved logits_{m}.npy  shape {arr.shape}")
+
+        # # np.save(miss_types_path, miss_types)
+        with open(Path(miss_types_path).with_suffix(".json"), "w+") as jfp:
+            json.dump(miss_types, jfp)
+
+        metrics_path = Path(metrics_out_fmt.format(targ="metrics")).with_suffix(".json")
+
+        # write metrics
+        with open(metrics_path, "w+") as jfp:
+            json.dump(prepare_metrics_for_json([metrics]), jfp)
+
+        # Save evaluation metadata for consistency tracking
+        eval_metadata = {
+            "cmam_state_hash": CheckpointManager.calculate_model_state_hash(cmam.state_dict()),
+            "model_state_hash": CheckpointManager.calculate_model_state_hash(model.state_dict()),
+            "evaluation_timestamp": time.time(),
+            "targets_shape": list(targets.shape),
+            "predictions_shape": list(preds.shape),
+            "logits_shape": list(logits.shape),
+            "rec_logits_shape": list(rec_logits.shape),
+            "num_miss_types": len(miss_types),
+            "unique_miss_types": list(np.unique(miss_types)),
+        }
+        
+        eval_metadata_path = Path(metrics_out_fmt.format(targ="evaluation_metadata")).with_suffix(".json")
+        with open(eval_metadata_path, "w+") as jfp:
+            json.dump(eval_metadata, jfp, indent=2)
+
+        console.print(f"> Saved targets with shape {targets.shape} to {targets_path}")
+        console.print(f"> Saved preds with shape {preds.shape} to {preds_path}")
+        console.print(f"> Saved logits with shape {logits.shape} to {logits_path}")
+        console.print(f"> Saved rec_logits with shape {rec_logits.shape} to {rec_logits_path}")
+        console.print(f"> Saved miss_types with len {len(miss_types)} to {miss_types_path}")
+        console.print(f"> Saved evaluation metadata to {eval_metadata_path}")
+
+    console.display_validation_metrics(metrics)
+
+    for group in metrics:
+        if isinstance(metrics[group], dict):
+            console.rule(f"Test - {group}")
+            console.display_validation_metrics(metrics[group])
 
     return experiment_data["metrics_history"]
 
 
-def main_cross_validation(config: CMAMConfig) -> Tuple[Module, Dict[str, Any], Path]:
-    """
-    Perform cross-validation training and evaluation.
+def _validate_model_state_for_evaluation(cmam: MultimodalModelProtocol, model: MultimodalModelProtocol, device: torch.device) -> None:
+    """Validate model state before evaluation to catch potential issues."""
+    logger.info("Validating model state for evaluation...")
+    
+    # Check if models are on the correct device
+    cmam_device = next(cmam.parameters()).device
+    model_device = next(model.parameters()).device
+    
+    if cmam_device != device:
+        logger.warning(f"C-MAM model is on {cmam_device} but expected {device}")
+        console.print(f"[yellow]Warning:[/] C-MAM model device mismatch: {cmam_device} vs {device}")
+    
+    if model_device != device:
+        logger.warning(f"Base model is on {model_device} but expected {device}")
+        console.print(f"[yellow]Warning:[/] Base model device mismatch: {model_device} vs {device}")
+    
+    # Check if models are in eval mode
+    if cmam.training:
+        logger.warning("C-MAM model is in training mode, setting to eval mode")
+        console.print("[yellow]Warning:[/] C-MAM model was in training mode, switching to eval")
+        cmam.eval()
+    
+    if model.training:
+        logger.warning("Base model is in training mode, setting to eval mode")
+        console.print("[yellow]Warning:[/] Base model was in training mode, switching to eval")
+        model.eval()
+    
+    # Calculate and log model state hashes for reproducibility tracking
+    cmam_state_hash = CheckpointManager.calculate_model_state_hash(cmam.state_dict())
+    model_state_hash = CheckpointManager.calculate_model_state_hash(model.state_dict())
+    
+    logger.info(f"Model state validation complete:")
+    logger.info(f"  C-MAM state hash: {cmam_state_hash}")
+    logger.info(f"  Base model state hash: {model_state_hash}")
+    
+    console.print(f"[green]✓[/] Model state validation complete")
+    console.print(f"  C-MAM state hash: {cmam_state_hash[:16]}...")
+    console.print(f"  Base model state hash: {model_state_hash[:16]}...")
 
-    Args:
-        config (StandardMultimodalConfig): Experiment configuration.
 
-    Returns:
-        Tuple[Module, Dict[str, Any], Path]: Trained model, experiment data, and output directory.
-    """
-    n_folds = config.experiment.cross_validation
-    fold_metrics = {}
-
-    console.start_task("Cross-Validation", total=n_folds)
-
-    models_output_path = Path(config.logging.model_output_path)
-
-    for fold_index in range(1, n_folds + 1):
-        console.print(f"\n[bold cyan]Starting Fold {fold_index}/{n_folds}[/]")
-        logger.info(f"Starting Fold {fold_index}/{n_folds}")
-
-        # Update paths for the fold
-        fold_output_dir = models_output_path / f"fold_{fold_index}"
-        fold_output_dir.mkdir(parents=True, exist_ok=True)
-        config.logging.model_output_path = str(fold_output_dir)
-
-        for dataset_config in config.data.datasets.values():
-            dataset_config.kwargs["cv_no"] = fold_index
-
-        # Prepare fold-specific components
-        dataloaders = setup_dataloaders(config)
-        console.print(f"Finished building dataloaders for split {fold_index}.")
-        cmam, model, optimizer, loss_functions, scheduler, device, metric_recorder = setup_model_components(
-            config=config, dataloaders=dataloaders
-        )
-        checkpoint_manager, experiment_data, report_generator, monitor = setup_tracking(
-            config=config, output_dir=fold_output_dir, model=model
-        )
-
-        try:
-            # Train and validate
-            _ = _train_loop(
-                cmam=cmam,
-                config=config,
-                model=model,
-                dataloaders=dataloaders,
-                optimizer=optimizer,
-                loss_functions=loss_functions,
-                device=device,
-                metric_recorder=metric_recorder,
-                checkpoint_manager=checkpoint_manager,
-                scheduler=scheduler,
-                experiment_data=experiment_data,
-                monitor=monitor,
-            )
-
-            # Test
-            test_metrics = test(
-                cmam=cmam,
-                model=model,
-                dataloaders=dataloaders,
-                loss_functions=loss_functions,
-                device=device,
-                metric_recorder=metric_recorder,
-                checkpoint_manager=checkpoint_manager,
-                experiment_data=experiment_data,
-                monitor=monitor,
-            )
-            fold_metrics[fold_index] = test_metrics
-
-        finally:
-            if monitor:
-                monitor.close()
-                model.detach_monitor()
-
-        console.update_task("Cross-Validation", advance=1)
-
-    console.complete_task("Cross-Validation")
-
-    _train_metrics = []
-    _val_metrics = []
-    _test_metrics = []
-
-    for fold in fold_metrics:
-        ## Basically, the train and validation is just a list of metric dicts for each epoch of training.
-        train_metrics: List[Dict[str, Any]] = fold_metrics[fold]["train"]
-        val_metrics: List[Dict[str, Any]] = fold_metrics[fold]["validation"]
-
-        ## The test metrics is a single dict with the metrics for the test split.
-        test_metrics: Dict[str, Any] = fold_metrics[fold]["test"]
-
-        ## Need to both save the metrics per fold and also aggregate them for the final report.
-
-        train_output_path = config.logging.metrics_path / f"fold_{fold}" / "train_metrics.json"
-        val_output_path = config.logging.metrics_path / f"fold_{fold}" / "validation_metrics.json"
-        test_output_path = config.logging.metrics_path / f"fold_{fold}" / "test_metrics.json"
-
-        ## TODO Move this functionality elsewhere. I don't think it belongs in the main code.
-
-        os.makedirs(train_output_path.parent, exist_ok=True)
-        os.makedirs(val_output_path.parent, exist_ok=True)
-        os.makedirs(test_output_path.parent, exist_ok=True)
-
-        with open(train_output_path, "w") as f:
-            json.dump(prepare_metrics_for_json(train_metrics), f, indent=4)
-
-        with open(val_output_path, "w") as f:
-            json.dump(prepare_metrics_for_json(val_metrics), f, indent=4)
-
-        with open(test_output_path, "w") as f:
-            json.dump(prepare_metrics_for_json([test_metrics]), f, indent=4)
-
-        _train_metrics.append(train_metrics)
-        _val_metrics.append(val_metrics)
-        _test_metrics.append(test_metrics)
-
-    ## Aggregate metrics for final report
-    ## TODO Move this functionality elsewhere. I don't think it belongs in the main code.
-
-    def aggregate_cv_metrics(fold_metrics: List[List[Dict[str, Any]]] | List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """
-        Aggregate metrics across CV folds by averaging per epoch.
-
-        Args:
-            fold_metrics: List of metrics per fold, where each fold contains a list of metric dicts per epoch
-
-        Returns:
-            List of dicts containing averaged metrics per epoch
-        """
-        # Handle single-epoch test metrics
-        if isinstance(fold_metrics[0], dict):
-            fold_metrics = [[m] for m in fold_metrics]
-
-        # Validate all folds have same number of epochs
-        n_epochs = len(fold_metrics[0])
-        if not all(len(fold) == n_epochs for fold in fold_metrics):
-            raise ValueError("All folds must have the same number of epochs")
-
-        # Validate all epochs have the same metric keys across folds
-        metric_keys = set(fold_metrics[0][0].keys())
-        for fold in fold_metrics:
-            for epoch_metrics in fold:
-                if set(epoch_metrics.keys()) != metric_keys:
-                    raise ValueError("All epochs must have the same metric keys")
-
-        # Initialize storage for aggregated metrics
-        aggregated_metrics = []
-
-        # For each epoch
-        for epoch in range(n_epochs):
-            epoch_metrics = defaultdict(list)
-
-            # Collect metrics from each fold for this epoch
-            for fold in fold_metrics:
-                for metric_name, value in fold[epoch].items():
-                    # Skip non-numeric values
-                    if isinstance(value, (int, float)):
-                        epoch_metrics[metric_name].append(value)
-
-            # Average metrics across folds
-            averaged_metrics = {metric_name: float(np.mean(values)) for metric_name, values in epoch_metrics.items()}
-
-            aggregated_metrics.append(averaged_metrics)
-
-        return aggregated_metrics
-
-    train_metrics = aggregate_cv_metrics(_train_metrics)
-    val_metrics = aggregate_cv_metrics(_val_metrics)
-    test_metrics = aggregate_cv_metrics(_test_metrics)
-
-    train_output_path = config.logging.metrics_path / "train_metrics_agg.json"
-    val_output_path = config.logging.mm_config.metrics_path / "validation_metrics_agg.json"
-    test_output_path = config.logging.mm_config.metrics_path / "test_metrics_agg.json"
-
-    with open(train_output_path, "w") as f:
-        json.dump(prepare_metrics_for_json(train_metrics), f, indent=4)
-    console.print(f"[green]✓[/] Saved aggregated train metrics to: {train_output_path}")
-
-    with open(val_output_path, "w") as f:
-        json.dump(prepare_metrics_for_json(val_metrics), f, indent=4)
-    console.print(f"[green]✓[/] Saved aggregated validation metrics to: {val_output_path}")
-
-    with open(test_output_path, "w") as f:
-        json.dump(prepare_metrics_for_json(test_metrics), f, indent=4)
-    console.print(f"[green]✓[/] Saved aggregated test metrics to: {test_output_path}")
-
-    return model, experiment_data, fold_output_dir
+def _set_deterministic_evaluation_seeds() -> None:
+    """Set deterministic seeds for evaluation consistency."""
+    import random
+    
+    # Set fixed seeds for evaluation reproducibility
+    eval_seed = 42  # Fixed seed for evaluation
+    
+    torch.manual_seed(eval_seed)
+    np.random.seed(eval_seed)
+    random.seed(eval_seed)
+    
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(eval_seed)
+        torch.cuda.manual_seed_all(eval_seed)
+        # Ensure deterministic behavior
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+    
+    logger.info(f"Set deterministic evaluation seeds to {eval_seed}")
+    console.print(f"[green]✓[/] Set deterministic evaluation seeds")
 
 
 def main(
@@ -926,6 +1022,9 @@ def main(
     gpu_mem_info = gpu_memory().replace("\t", " ")
     logger.info(gpu_mem_info)
     console.print(gpu_mem_info)
+    console.print(f"[bold green]Model Parameters:[/] [blue]{experiment_data['model_info']['parameters']:,}[/]")
+    console.print(count_parameters(cmam))
+
     if config.experiment.dry_run:
         console.print("[yellow]Dry run completed. Exiting.[/]")
         return model, experiment_data, output_dir
@@ -961,23 +1060,24 @@ def main(
                 checkpoint_manager=checkpoint_manager,
                 experiment_data=experiment_data,
                 monitor=monitor,
+                metrics_out_fmt=config.logging.metrics_path / "test_{targ}.npy",
             )
 
-            if "embeddings" in dataloaders:
-                console.print("[bold cyan]Generating embeddings for visualization...[/]")
-                embeddings = cmam.get_embeddings(dataloaders["embeddings"], trained_model=model, device=device)
-                labels = embeddings[cmam.labels_key]
-                rec_embds = safe_detach(embeddings["rec_embd"])
-                target_embds = safe_detach(embeddings["target_embd"])
-                labels = safe_detach(labels)
-                experiment_data["embeddings"] = {"labels": labels, "rec_embd": rec_embds, "target_embd": target_embds}
-                save_fp = config.logging.metrics_path / "embeddings" / f"{cmam.target_modality}_rec_embeddings.npy"
-                console.print(f"[green]✓[/] Saved embeddings to: {save_fp}")
-                np.save(save_fp, rec_embds)
+            # if "embeddings" in dataloaders and hasattr(cmam,"get_embeddings"):
+            #     console.print("[bold cyan]Generating embeddings for visualization...[/]")
+            #     embeddings = cmam.get_embeddings(dataloaders["embeddings"], trained_model=model, device=device)
+            #     labels = embeddings[cmam.labels_key]
+            #     rec_embds = safe_detach(embeddings["rec_embd"])
+            #     target_embds = safe_detach(embeddings["target_embd"])
+            #     labels = safe_detach(labels)
+            #     experiment_data["embeddings"] = {"labels": labels, "rec_embd": rec_embds, "target_embd": target_embds}
+            #     save_fp = config.logging.metrics_path / "embeddings" / f"{cmam.target_modality}_rec_embeddings.npy"
+            #     console.print(f"[green]✓[/] Saved embeddings to: {save_fp}")
+            #     np.save(save_fp, rec_embds)
 
-                save_fp = config.logging.metrics_path / "embeddings" / f"{cmam.target_modality}_target_embeddings.npy"
-                np.save(save_fp, target_embds)
-                console.print(f"[green]✓[/] Saved embeddings to: {save_fp}")
+            #     save_fp = config.logging.metrics_path / "embeddings" / f"{cmam.target_modality}_target_embeddings.npy"
+            #     np.save(save_fp, target_embds)
+            #     console.print(f"[green]✓[/] Saved embeddings to: {save_fp}")
 
     finally:
         if monitor:
@@ -1016,9 +1116,9 @@ if __name__ == "__main__":
     if args.disable_monitoring:
         config.monitoring.enabled = False
 
-    if config.experiment.cross_validation:
-        main_cross_validation(config)
-    else:
-        main(config)
+    # if config.experiment.cross_validation:
+    #     main_cross_validation(config)
+    # else:
+    main(config)
 
     shutdown_cursor_reset_hook()

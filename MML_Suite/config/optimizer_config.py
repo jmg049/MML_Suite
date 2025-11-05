@@ -104,12 +104,12 @@ class ParameterGroupsOptimizer:
         """
         self.optimizer_config = optimizer_config
 
-    def _validate_regex_patterns(self, model: Module) -> Dict[str, List[str]]:
+    def _validate_regex_patterns(self, all_params) -> Dict[str, List[str]]:
         """
         Validate regex patterns and detect potential overlaps.
         Returns a dictionary mapping group names to lists of overlapping parameters.
         """
-        all_params = dict(model.named_parameters())
+        # all_params = dict(model.named_parameters())
         overlap_map = {}
         used_params = set()
 
@@ -134,10 +134,10 @@ class ParameterGroupsOptimizer:
 
         return overlap_map
 
-    def _create_parameter_groups(self, model: Module) -> List[Dict]:
+    def _create_parameter_groups(self, all_params) -> List[Dict]:
         """Create parameter groups based on configuration."""
         # First validate patterns and check for overlaps
-        overlap_map = self._validate_regex_patterns(model)
+        overlap_map = self._validate_regex_patterns(all_params)
         if overlap_map:
             overlap_details = "\n".join(
                 f"  - Group '{group}' overlaps on parameters: {', '.join(params)}"
@@ -148,7 +148,6 @@ class ParameterGroupsOptimizer:
                 f"matching group only:\n{overlap_details}"
             )
 
-        all_params = dict(model.named_parameters())
         used_params = set()
         parameter_groups = []
 
@@ -209,11 +208,11 @@ class ParameterGroupsOptimizer:
 
         return parameter_groups
 
-    def get_optimizer(self, model: Module) -> optim.Optimizer:
+    def get_optimizer(self, all_params) -> optim.Optimizer:
         """Create optimizer instance with parameter groups."""
         try:
             optimizer_class = resolve_optimizer(self.optimizer_config.name)
-            parameter_groups = self._create_parameter_groups(model)
+            parameter_groups = self._create_parameter_groups(all_params)
 
             # Log parameter group information
             for idx, group in enumerate(parameter_groups):

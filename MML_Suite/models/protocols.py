@@ -1,3 +1,4 @@
+from __future__ import annotations
 from typing import Any, Dict, Protocol, Tuple
 
 import numpy as np
@@ -38,3 +39,6 @@ class MultimodalModelProtocol(Protocol):
     def get_embeddings(
         self, dataloader: DataLoader, device: torch.device
     ) -> Tuple[Dict[Modality, np.ndarray], Dict[Modality, np.ndarray]] | Dict[Modality, np.ndarray]: ...
+
+
+    def to(self, device: torch.device) -> MultimodalModelProtocol: ...

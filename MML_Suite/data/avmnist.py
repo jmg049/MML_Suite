@@ -14,6 +14,10 @@ from modalities import Modality
 from PIL import Image
 from torch.utils.data import DataLoader
 from torchvision.transforms.v2 import PILToTensor, ToDtype
+from experiment_utils.utils import get_console
+
+console  = get_console()
+
 
 logger = get_logger()
 
@@ -50,11 +54,13 @@ class AVMNIST(MultimodalBaseDataset):
         *,
         missing_patterns: Optional[Dict[str, Dict[str, float]]] = None,
         selected_patterns: Optional[List[str]] = None,
+        missing_strategy: Literal["zero", "noise"] = "zero",
         audio_column: str = "audio",
         image_column: str = "image",
         labels_column: str = "label",
         split_indices: Optional[List[int]] = None,
         _id: int = 1,
+        **kwargs,
     ) -> None:
         """
         Initialize the AVMNIST dataset.
@@ -75,9 +81,30 @@ class AVMNIST(MultimodalBaseDataset):
             "a": {Modality.AUDIO: 1.0, Modality.IMAGE: 0.0},  # Audio only
             "i": {Modality.AUDIO: 0.0, Modality.IMAGE: 1.0},  # Image only
         }
-        super().__init__(split=split, selected_patterns=selected_patterns, missing_patterns=m_patterns, _id=_id)
 
         assert split in AVMNIST.VALID_SPLITS, f"Invalid split provided, must be one of {AVMNIST.VALID_SPLITS}"
+
+        # train
+        #  IMAGE → mean = 0.0857,  std = 0.2487
+        #  AUDIO → mean = 97562.3273,  std = 627670.5328
+
+        # validation
+        # IMAGE → mean = 0.0889,  std = 0.2532
+        # AUDIO → mean = 97426.6131,  std = 624061.4419
+
+        # test
+        #  IMAGE → mean = 0.0876,  std = 0.2511
+        #  AUDIO → mean = 91291.6249,  std = 603451.1890
+
+        ## Only used for noisy training
+        modality_stats = {
+            Modality.AUDIO: {"mean": 97562.3273, "std": 627670.5328},
+            Modality.IMAGE: {"mean": 0.0857, "std": 0.2487},
+        }
+    
+        super().__init__(split=split, selected_patterns=selected_patterns, missing_patterns=m_patterns, _id=_id, missing_strategy=missing_strategy, modality_stats=modality_stats)
+
+
 
         self.data_fp = Path(data_fp)
         if not self.data_fp.exists():
@@ -96,6 +123,7 @@ class AVMNIST(MultimodalBaseDataset):
 
         # Load and process data
         self._load_data(split_indices)
+
 
         self.num_samples = len(self.data)
 
@@ -265,6 +293,7 @@ class AVMNIST(MultimodalBaseDataset):
                 for mod in [Modality.AUDIO, Modality.IMAGE]
                 if mod in batch[0]["missing_mask"]
             },
+            "sample_idx": torch.tensor([b["sample_idx"] for b in batch], device=device),
         }
 
         if self.target_modality == Modality.MULTIMODAL:

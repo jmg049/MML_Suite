@@ -112,6 +112,9 @@ class FcClassifier(Module):
         self.fc_out = Linear(layers[-1], output_dim)
 
     def forward(self, x) -> Tensor:
+        if x.shape[0] == 1:
+            # If batch size is 1, we need to duplicate the input to avoid issues with batch normalization
+            x = x.repeat(2, 1)
         feat = self.module(x)
         out = self.fc_out(feat)
         return out

@@ -46,3 +46,17 @@
 #     "GatedBiModalNetwork",
 #     "MaxOut",
 # ]
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class L2Normalization(nn.Module):
+    def __init__(self):
+        super(L2Normalization, self).__init__()
+
+    def forward(self, x):
+        # Normalize input tensor x along the embedding dimension (dim=1)
+        return F.normalize(x, p=2, dim=1)
+
+

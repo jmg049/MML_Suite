@@ -10,6 +10,8 @@ experiment: !ExperimentConfig
 model: !ModelConfig
   name: "AVMNIST"
   model_type: "AVMNIST"
+  pretrained_path: $EXP_PATH/wch1/AVMNIST_Multimodal_Baseline_Training/models/{run_id}/best.pth
+
   audio_encoder: !MNISTAudio
     conv_block_one_one_args: !ConvBlockArgs
       conv_one_in: 1
@@ -114,7 +116,7 @@ data: !DataConfig
         selected_patterns: ["ai", "a", "i"]
     # embeddings: !DatasetConfig
     #   dataset: "AVMNIST"
-    #   data_fp: "$EXP_PATH/DATA/avmnist/test_subset.csv"
+    #   data_fp: "$DATA/avmnist/test_subset.csv"
     #   split: "test"
     #   target_modality: !Modality "MULTIMODAL"
     #   shuffle: true
@@ -188,11 +190,11 @@ metrics:
     classification: ["accuracy", "balanced_accuracy", "f1_macro", "f1_micro", "f1_weighted", "precision_macro", "precision_micro", "precision_weighted", "recall_macro", "recall_micro", "recall_weighted", "ConfusionMatrix"]
 
 logging:
-  log_path: "$EXP_PATH/experiments_output/wch1/{experiment_name}/logs/{run_id}"
-  model_output_path: "$EXP_PATH/experiments_output/wch1/{experiment_name}/models/{run_id}"
-  metrics_path: "$EXP_PATH/experiments_output/wch1/{experiment_name}/metrics/{run_id}"
+  log_path: "$EXP_PATH/wch1/{experiment_name}/logs/{run_id}"
+  model_output_path: "$EXP_PATH/wch1/{experiment_name}/models/{run_id}"
+  metrics_path: "$EXP_PATH/wch1/{experiment_name}/metrics/{run_id}"
   save_metric: "loss"
-  monitor_path: "$EXP_PATH/experiments_output/wch1/{experiment_name}/monitoring/{run_id}"
+  monitor_path: "$EXP_PATH/wch1/{experiment_name}/monitoring/{run_id}"
 
 monitoring:
   enabled: false

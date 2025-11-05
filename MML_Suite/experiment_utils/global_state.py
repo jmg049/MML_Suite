@@ -5,7 +5,9 @@ DEBUG: bool = True
 
 def set_current_run_id(run_id: int):
     global CURRENT_RUN_ID
+
     CURRENT_RUN_ID = run_id
+    print(f"Current run ID set to: {CURRENT_RUN_ID}")
 
 
 def set_current_exp_name(exp_name: str):

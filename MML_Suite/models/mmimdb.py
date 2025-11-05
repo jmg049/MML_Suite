@@ -157,8 +157,6 @@ class GMUModel(Module):
         Returns:
             Tensor: Output logits.
         """
-        assert not all((I is None, T is None)), "At least one modality must be provided"
-        assert not all((is_embd_I, is_embd_T)), "Cannot both be embeddings"
 
         image = self.image_model(I) if not is_embd_I else I
         text = self.text_model(T) if not is_embd_T else T

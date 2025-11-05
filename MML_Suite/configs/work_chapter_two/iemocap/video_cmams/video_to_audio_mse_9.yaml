@@ -1,0 +1,285 @@
+!CMAMConfig
+experiment: !ExperimentConfig
+  name: "UTT_FUSION IEMOCAP 9 Video to Audio CMAM"
+  device: "cuda"
+  train_print_interval_epochs: 1
+  validation_print_interval_epochs: 1
+  is_train: true
+  is_test: true
+  cross_validation: 10
+
+
+model: !ModelConfig
+  name: "UTT-Fusion"
+  model_type: "UttFusionModel"
+  pretrained_path: "$EXP_PATH/wch1/UTT_FUSION_IEMOCAP_9/models/{run_id}/best.pth"
+  
+  netA: !LSTMEncoder
+    input_size: 130
+    hidden_size: 128
+    embd_method: "maxpool"
+
+  netV: !LSTMEncoder
+    input_size: 342
+    hidden_size: 128
+    embd_method: "maxpool"
+
+  netT: !TextCNN
+    input_size: 1024
+    dropout: 0.3
+    in_channels: 1
+    out_channels: 128
+    kernel_heights: 
+      - 3
+      - 4
+      - 5
+  netC: !FcClassifier
+    input_dim: 384
+    layers: 
+      - 128
+      - 128
+    output_dim: 4
+    dropout: 0.3
+    use_bn: true
+
+  clip: 0.5
+
+
+cmam: !ModelConfig
+  name: "Simple_CMAM"
+  model_type: "Simple_CMAM"
+  target_modality: !Modality audio
+  load_pretrained_encoder_state_for: []
+  labels_key: "label"
+  input_modalities:
+    - !Modality video
+  association_network: !AssociationNetwork
+    input_size: 128
+    hidden_size: 128
+    output_size: 128
+    dropout: 0.4
+    batch_norm: True
+
+training:
+  epochs: 20
+  batch_size: 128 
+  early_stopping: false
+  early_stopping_patience: 15
+  early_stopping_metric: "loss"
+  num_modalities: 3
+  optimizer: !Optimizer
+    name: "Adam"
+    default_kwargs:
+      lr: 2e-4
+      weight_decay: 0.00001
+  loss_functions: !LossFunctionGroup
+    cmam: 
+      loss_name: "cmam"
+      loss_kwargs: {
+        cosine_weight: 0.0,
+        mse_weight: 1.0,
+        mae_weight: 0.0,
+        cls_weight: 0.00
+      }
+      weight: 1.0  
+
+data: !DataConfig
+  use_collate_fn: true
+  datasets:
+    train: !DatasetConfig
+      dataset: "iemocap"
+      data_fp: "$DATA/iemocap"
+      split: "train"
+      target_modality: !Modality "MULTIMODAL"
+      shuffle: true
+      drop_last: true
+      batch_size: 128
+      cv_no: 9
+      missing_patterns: !MissingPatternConfig
+        modalities:
+          !Modality audio: !ModalityConfig
+            missing_rate: 0.0  # Audio is ALWAYS present when included in pattern
+          !Modality video: !ModalityConfig
+            missing_rate: 0.0  # Video is ALWAYS present when included in pattern
+          !Modality text: !ModalityConfig 
+            missing_rate: 0.0  # Text is ALWAYS present when included in pattern
+        selected_patterns: ["av"]  # Only use these combinations of modalities
+      kwargs:
+        labels_key: "classification_labels"
+        A_type: "comparE"
+        name: iemocap
+
+    validation: !DatasetConfig
+      dataset: "iemocap"
+      data_fp: "$DATA/iemocap"
+      split: "valid"
+      shuffle: true
+      drop_last: true
+      batch_size: 128
+      cv_no: 9
+      target_modality: !Modality "MULTIMODAL"
+      missing_patterns: !MissingPatternConfig
+        modalities:
+          !Modality audio: !ModalityConfig
+            missing_rate: 0.0  # Audio is ALWAYS present when included in pattern
+          !Modality video: !ModalityConfig
+            missing_rate: 0.0  # Video is ALWAYS present when included in pattern
+          !Modality text: !ModalityConfig 
+            missing_rate: 0.0  # Text is ALWAYS present when included in pattern
+        selected_patterns: ["av"]
+      kwargs:
+        labels_key: "classification_labels"
+        A_type: "comparE"
+        name: iemocap
+
+    test: !DatasetConfig
+      dataset: "iemocap"
+      data_fp: "$DATA/iemocap"
+      split: "test"
+      target_modality: !Modality "MULTIMODAL"
+      shuffle: false
+      drop_last: true
+      batch_size: 128
+      cv_no: 9
+      missing_patterns: !MissingPatternConfig
+        modalities:
+          !Modality audio: !ModalityConfig
+            missing_rate: 0.0  # Audio is ALWAYS present when included in pattern
+          !Modality video: !ModalityConfig
+            missing_rate: 0.0  # Video is ALWAYS present when included in pattern
+          !Modality text: !ModalityConfig 
+            missing_rate: 0.0  # Text is ALWAYS present when included in pattern
+        selected_patterns: ["av"]
+      kwargs:
+        labels_key: "classification_labels"
+        A_type: "comparE"
+        name: iemocap
+    embeddings: !DatasetConfig
+      dataset: "iemocap"
+      data_fp: "$DATA/iemocap"
+      split: "test"
+      target_modality: !Modality "MULTIMODAL"
+      shuffle: false
+      drop_last: true
+      batch_size: 128
+      cv_no: 9
+      missing_patterns: !MissingPatternConfig
+        modalities:
+          !Modality audio: !ModalityConfig
+            missing_rate: 0.0  # Audio is ALWAYS present when included in pattern
+          !Modality video: !ModalityConfig
+            missing_rate: 0.0  # Video is ALWAYS present when included in pattern
+          !Modality text: !ModalityConfig 
+            missing_rate: 0.0  # Text is ALWAYS present when included in pattern
+        selected_patterns: ["av"]
+      kwargs:
+        labels_key: "classification_labels"
+        A_type: "comparE"
+        name: iemocap
+metrics:
+  metrics:
+    Balanced_Accuracy:
+      function: "sklearn.metrics.balanced_accuracy_score"
+      kwargs: {}
+      level: "epoch"
+    Accuracy:
+      function: "sklearn.metrics.accuracy_score"
+      kwargs: {}
+      level: "epoch"
+    F1_Weighted:
+      function: "sklearn.metrics.f1_score"
+      kwargs: 
+        average: "weighted"
+        zero_division: 0
+      level: "epoch"    
+    F1_Micro:
+      function: "sklearn.metrics.f1_score"
+      kwargs: 
+        average: "micro"
+        zero_division: 0
+      level: "epoch"
+    F1_Macro:
+      function: "sklearn.metrics.f1_score"
+      kwargs:
+        average: "macro"
+        zero_division: 0
+      level: "epoch"
+    Precision_Weighted:
+      function: "sklearn.metrics.precision_score"
+      kwargs: 
+        average: "weighted"
+        zero_division: 0
+      level: "epoch"
+    Precision_Micro:
+      function: "sklearn.metrics.precision_score"
+      kwargs:
+        average: "micro"
+        zero_division: 0
+      level: "epoch"
+    Precision_Macro:
+      function: "sklearn.metrics.precision_score"
+      kwargs:
+        average: "macro"
+        zero_division: 0
+      level: "epoch"
+    Recall_Weighted:
+      function: "sklearn.metrics.recall_score"
+      kwargs: 
+        average: "weighted"
+        zero_division: 0
+      level: "epoch"
+    Recall_Micro:
+      function: "sklearn.metrics.recall_score"
+      kwargs: 
+        average: "micro"
+        zero_division: 0
+      level: "epoch"
+    Recall_Macro:
+      function: "sklearn.metrics.recall_score"
+      kwargs: 
+        average: "macro"
+        zero_division: 0
+      level: "epoch"
+    MSA:
+      function: "metrics.msa_binary_classification"
+      kwargs: {}
+      level: "epoch"
+    ConfusionMatrix:
+      function: "metrics.confusion_matrix_from_logits"
+      kwargs: {
+        "labels": [0, 1, 2, 3]
+      }
+      level: "epoch"
+    mae:
+      function: "sklearn.metrics.mean_absolute_error"
+      kwargs: {}
+    mse:
+      function: "sklearn.metrics.mean_squared_error"
+      kwargs: {}
+    cosine:
+      function: "metrics.cosine_similarity"
+      kwargs: {}
+  groups:
+      classification: ["Balanced_Accuracy", "F1_Weighted", "F1_Micro", "F1_Macro", "Precision_Weighted", "Precision_Micro", "Precision_Macro", "Recall_Weighted", "Recall_Micro", "Recall_Macro", "ConfusionMatrix"]
+      reconstruction: ["mae", "mse", "cosine"]
+
+logging:
+  log_path: "$EXP_PATH/wch2/{experiment_name}/logs/{run_id}"
+  model_output_path: "$EXP_PATH/wch2/{experiment_name}/models/{run_id}"
+  metrics_path: "$EXP_PATH/wch2/{experiment_name}/metrics/{run_id}"
+  save_metric: "loss"
+  monitor_path: "$EXP_PATH/wch2/{experiment_name}/monitoring/{run_id}"
+
+monitoring:
+  enabled: false
+  gradient_interval: 100
+  activation_interval: 100
+  weight_interval: 200
+  buffer_size: 1000
+  compression: "gzip"
+  compression_opts: 4
+  enable_gradient_tracking: true
+  enable_activation_tracking: true
+  enable_weight_tracking: true
+  enable_layer_convergence: true
+  enable_information_flow: false

@@ -103,8 +103,10 @@ class CMAMConfig(BaseExperimentConfig):
                     format_path_with_env(model_config.pretrained_path)
                 )
                 console.print(f"Pretrained Path: {model_config.pretrained_path}")
-                model_config.validate_config(run_id=run_id)
+                model_config.validate_config(run_id=run_id, is_cv=experiment_config.cross_validation is not None)
             training_config = TrainingConfig.from_dict(data["training"])
+
+            training_config._display_config()
 
             metrics_config = MetricConfig.from_dict(data["metrics"])
 

@@ -11,6 +11,7 @@ from typing import Any, Dict, List, Literal, Optional, Tuple
 
 import numpy as np
 import torch
+from experiment_utils.global_state import set_current_run_id
 from config.multimodal_training_config import StandardMultimodalConfig
 from config.resolvers import resolve_init_fn, resolve_model_name
 from experiment_utils.checkpoints import CheckpointManager
@@ -21,6 +22,8 @@ from experiment_utils.experiment_report import (
     ModelReport,
     TimingReport,
 )
+from prettytable import PrettyTable
+
 from experiment_utils.logging import LoggerSingleton, configure_logger, get_logger
 from experiment_utils.loss import LossFunctionGroup
 from experiment_utils.metric_recorder import MetricRecorder
@@ -115,6 +118,7 @@ def setup_dataloaders(config: StandardMultimodalConfig) -> Dict[str, DataLoader]
 
     for split, loader in dataloaders.items():
         dataset_size = len(loader.dataset)
+        console.print(f"> Dataloader Batch Size: {loader.batch_size}")
         logger.debug(f"{split} dataset size: {dataset_size}")
         if split in ["train", "validation"]:
             total_iterations = config.training.epochs * (dataset_size // loader.batch_size)
@@ -122,6 +126,18 @@ def setup_dataloaders(config: StandardMultimodalConfig) -> Dict[str, DataLoader]
 
     return dataloaders
 
+def count_parameters(model):
+    table = PrettyTable(["Modules", "Parameters"])
+    total_params = 0
+    for name, parameter in model.named_parameters():
+        if not parameter.requires_grad:
+            continue
+        params = parameter.numel()
+        table.add_row([name, params])
+        total_params += params
+    print(table)
+    print(f"Total Trainable Params: {total_params}")
+    return total_params
 
 def setup_model_components(
     config: StandardMultimodalConfig,
@@ -157,8 +173,10 @@ def setup_model_components(
     )
     logger.info(f"Model: {model}")
 
+
     device = config.experiment.device
     model.to(device)
+
 
     optimizer = config.get_optimizer(model)
     criterion = config.training.loss_functions
@@ -177,15 +195,19 @@ def setup_model_components(
         config.metrics, tensorboard_path=config.logging.tensorboard_path, tb_record_only=config.logging.tb_record_only
     )
 
+    model_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    console.print(f"[bold green]Model Parameters:[/] [blue]{model_parameters:,}[/]")
+    console.print(f"[bold green]Model Size:[/] [blue]{model_parameters * PARAMETER_SIZE_BYTES / 1024 / 1024:.2f} MB[/]")
+
     return model, optimizer, criterion, scheduler, device, metric_recorder
 
 
 def check_early_stopping(
     val_metrics: Dict[str, Any],
-    best_metrics: Optional[Dict[str, Any]],
-    patience: int,
-    min_delta: float,
     wait: int,
+    best_metrics: Optional[Dict[str, Any]],
+    patience: int = 10,
+    min_delta: float  = 0.0,
     mode: Literal["minimize", "maximize"] = "minimize",
     target_metric: str = "loss",
 ) -> Tuple[bool, bool, int]:
@@ -209,6 +231,7 @@ def check_early_stopping(
     if best_metrics is None:
         # No best metrics yet; current metrics are the best by default
         return True, True, 0
+
 
     metric_value = val_metrics.get(target_metric, None)
     best_value = best_metrics.get(target_metric, None)
@@ -251,9 +274,8 @@ def setup_tracking(
         device=config.experiment.device,
     )
 
-    if config.model.pretrained_path:
-        checkpoint_manager.model_dir = Path(config.model.pretrained_path).parent
-        console.print(f"Using pretrained model from: {config.model.pretrained_path}")
+    print(f"Has pretrained model: {config.model.pretrained_path}")
+
 
     experiment_data = {
         "metrics_history": {"train": [], "validation": [], "test": []},
@@ -377,57 +399,55 @@ def validate_epoch(
         Tuple[float, float]: Average loss and time per batch for this epoch.
     """
     model.eval()
-    targets = []
-    preds = []
-    logits = []
-    miss_types = []
+
+    buf_targets, buf_preds, buf_logits = [], [], []
+    buf_miss, buf_ids = [], []                          # <── new
     losses = defaultdict(list)
 
     console.start_task(task_name, total=len(val_loader), style="bright yellow")
-
-    start_time = time.time()
+    t0 = time.time()
 
     with torch.no_grad():
         for batch in val_loader:
-            validation_output = model.validation_step(
-                batch, loss_functions=loss_functions, device=device, metric_recorder=metric_recorder
+            out = model.validation_step(
+                batch,
+                loss_functions=loss_functions,
+                device=device,
+                metric_recorder=metric_recorder,
             )
-            validation_target = validation_output["targets"]
-            validation_pred = validation_output["predictions"]
-            validation_logits = validation_output["logits"]
-            validation_miss_types = validation_output["miss_type"]
 
-            targets.append(validation_target)
-            preds.append(validation_pred)
-            logits.append(validation_logits)
-            miss_types.extend(validation_miss_types)
-            loss = validation_output["loss"]
-            other_losses = validation_output.get("losses", None)
+            buf_targets.append(out["targets"])
+            buf_preds.append(out["predictions"])
+            buf_logits.append(out["logits"])
+            buf_miss.extend(out["miss_type"])           
+            buf_ids.extend(out["sample_ids"])
 
-            losses["loss"].append(loss)
-
-            if other_losses:
-                for key, value in other_losses.items():
-                    losses[key].append(value)
+            losses["loss"].append(out["loss"])
+            if "losses" in out:
+                for k, v in out["losses"].items():
+                    losses[k].append(v)
 
             if monitor:
                 monitor.step()
             console.update_task(task_name, advance=1)
-    time_taken = time.time() - start_time
-    time_taken /= len(val_loader)
-    time_taken = round(time_taken, 8)
+
+    time_taken = round((time.time() - t0) / len(val_loader), 8)
     console.complete_task(task_name)
 
-    losses = {key: np.mean(value) for key, value in losses.items()}
-    targets = np.concat(targets)
-    preds = np.concat(preds)
-    logits = np.concat(logits)
-    # miss_types = np.concat(miss_types)
-
+    # aggregate
+    losses = {k: float(np.mean(v)) for k, v in losses.items()}
+    targets = np.concatenate(buf_targets, axis=0)
+    preds   = np.concatenate(buf_preds,   axis=0)
+    logits  = np.concatenate(buf_logits,  axis=0)
+    miss    = np.array(buf_miss)
+    console.print(f"Miss shapes: {miss.shape}")  
+    ids     = np.array(buf_ids)                           
+    console.print(f"IDs shapes: {ids.shape}")            
     if ret_outputs:
-        return losses["loss"], time_taken, losses, (targets, preds, logits, miss_types)
-    return losses["loss"], time_taken, losses
+        #                ↓ return ids as well ↓
+        return losses["loss"], time_taken, losses, (targets, preds, logits, miss, ids)
 
+    return losses["loss"], time_taken, losses
 
 def _train_loop(
     config: StandardMultimodalConfig,
@@ -486,7 +506,7 @@ def _train_loop(
         train_metrics["loss"] = train_loss
         experiment_data["metrics_history"]["train"].append(train_metrics.copy())
         experiment_data["timing_history"]["train"].append(train_time)
-        console.print(f"Keys: {train_metrics.keys()}")
+        # console.print(f"Keys: {train_metrics.keys()}")
         console.display_validation_metrics(train_metrics)
 
         metric_recorder.reset()
@@ -549,6 +569,8 @@ def _train_loop(
             if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
                 scheduler.step(val_metrics["loss"])
             else:
+                # console.print(f"[grey] - Stepping scheduler at epoch {epoch}[/]")
+                # console.print(f"Scheduler args: {scheduler.__dict__}")
                 scheduler.step()
             console.print(f"[grey] - Learning rate: {optimizer.param_groups[0]['lr']:.2e}][/]")
 
@@ -571,345 +593,114 @@ def test(
     monitor: Optional[ExperimentMonitor] = None,
     metrics_out_fmt: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """
-    Perform testing on the model using the specified data loaders.
-
-    Args:
-        config (StandardMultimodalConfig): Experiment configuration.
-        model (Module): Model to test.
-        dataloaders (Dict[str, DataLoader]): Data loaders for testing splits.
-        loss_functions (LossFunctionGroup): Loss function group.
-        device (torch.device): Device for computation.
-        metric_recorder (MetricRecorder): Recorder for metrics.
-        checkpoint_manager (CheckpointManager): Manager for loading the best checkpoint.
-        experiment_data (Optional[Dict[str, Any]]): Experiment data storage dictionary.
-        monitor (Optional[ExperimentMonitor]): Optional experiment monitor.
-
-    Returns:
-        Dict[str, Any]: Metrics recorded during testing.
-    """
     checkpoint_manager.load_checkpoint(model=model, load_best=True)
-
     for split_name, loader in dataloaders.items():
-        if split_name in ["train", "validation", "embeddings"]:
+        if split_name in {"train", "validation", "embeddings"}:
             continue
 
         metric_recorder.reset()
         console.print(f"\n[bold cyan]Testing on {split_name} split[/]")
 
-        with torch.no_grad():
-            test_loss, test_time, test_loss_info, (targets, preds, logits, miss_types) = validate_epoch(
-                model=model,
-                val_loader=loader,
-                loss_functions=loss_functions,
-                device=device,
-                console=console,
-                metric_recorder=metric_recorder,
-                monitor=monitor,
-                task_name="test",
-                ret_outputs=True,
-            )
+        # ─── inference ───────────────────────────────────────────────────────
+        (
+            test_loss,
+            test_time,
+            test_loss_info,
+            (targets, preds, logits, miss_types, sample_ids),
+        ) = validate_epoch(
+            model=model,
+            val_loader=loader,
+            loss_functions=loss_functions,
+            device=device,
+            console=console,
+            metric_recorder=metric_recorder,
+            monitor=monitor,
+            task_name="test",
+            ret_outputs=True,
+        )
 
-        metrics = metric_recorder.calculate_all_groups(loss=test_loss, skip_tensorboard=True)
+        console.print(f"Immediate accuracy: {float((np.argmax(logits, 1) == targets).mean())}")
+
+        # ─── alignment by sample_id ─────────────────────────────────────────
+        unique_masks = np.unique(miss_types)                 # e.g. ['av', 'a', 'v']
+        console.print(f"Unique miss types: {unique_masks}")
+
+        # map: mask → { sample_id : row_index }
+        id2row = {
+            m: {sid: idx for idx, sid in zip(np.where(miss_types == m)[0],
+                                             sample_ids[miss_types == m])}
+            for m in unique_masks
+        }
+
+        # choose canonical mask: longest string (usually "full" or "atv…")
+        canonical = max(unique_masks, key=len)
+        order_ids = sample_ids[miss_types == canonical]      # (N,) canonical order
+        # assemble aligned tensors
+        aligned_logits: Dict[str, np.ndarray] = {}
+        for m in unique_masks:
+            try:
+                stack = []
+
+                for sid in order_ids:
+                    if sid in id2row[m]:
+                        stack.append(logits[id2row[m][sid]])
+                    else:
+                        stack.append(np.zeros(logits.shape[1], dtype=logits.dtype))
+
+            except KeyError as e:
+                print(len(id2row[m]))
+                console.print(f"[bold red]Error aligning logits for mask {m}[/]")
+                raise e
+
+            aligned_logits[m] = np.stack(stack, axis=0)  # (N, C)
+        targets_algn = targets[[id2row[canonical][sid] for sid in order_ids]]
+
+        # sanity: all tensors same shape
+        for m, arr in aligned_logits.items():
+            assert arr.shape == aligned_logits[canonical].shape, \
+                f"Shape mismatch for mask {m}"
+
+        # ─── record metrics ────────────────────────────────────────────────
+        metrics = metric_recorder.calculate_all_groups(
+            loss=test_loss, skip_tensorboard=True
+        )
         metrics = flatten_dict(metrics)
-        metrics.update({k: np.mean(v) for k, v in test_loss_info.items()})
-        experiment_data["metrics_history"][split_name] = metrics
-        experiment_data["timing_history"][split_name] = [test_time]
-    # output
-    if metrics_out_fmt:
-        metrics_out_fmt = str(metrics_out_fmt)
+        metrics.update({k: float(np.mean(v)) for k, v in test_loss_info.items()})
 
-        timing = metrics_out_fmt.format(targ="params_timing")
-        timing = Path(timing).with_suffix(".txt")
-        os.makedirs(timing.parent, exist_ok=True)
-        with open(timing, "w+") as f:
-            parameter_count = sum(p.numel() for p in model.parameters() if p.requires_grad)
-            f.write(f"parameter_count: {parameter_count}\n")
-            f.write(f"test_time: {test_time}")
-            console.print(f"> Saved test timing ({test_time}s) to {timing}")
-        targets_path = metrics_out_fmt.format(targ="targets")
-        preds_path = metrics_out_fmt.format(targ="preds")
-        logits_path = metrics_out_fmt.format(targ="logits")
-        miss_types_path = metrics_out_fmt.format(targ="miss_types")
+        experiment_data.setdefault("metrics_history", {})[split_name] = metrics
+        experiment_data.setdefault("timing_history",  {})[split_name] = [test_time]
 
-        np.save(targets_path, targets)
-        np.save(preds_path, preds)
-        np.save(logits_path, logits)
-        # np.save(miss_types_path, miss_types)
-        with open(Path(miss_types_path).with_suffix(".json"), "w+") as jfp:
-            json.dump(miss_types, jfp)
+        # ─── save artefacts ────────────────────────────────────────────────
+        if metrics_out_fmt:
+            fmt = str(metrics_out_fmt)                       # Path pattern
 
+            # timing -------------------------------------------------------
+            timing_path = Path(fmt.format(targ="params_timing")).with_suffix(".txt")
+            timing_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(timing_path, "w") as fp:
+                n_params = sum(p.numel() for p in model.parameters()
+                               if p.requires_grad)
+                fp.write(f"parameter_count: {n_params}\n")
+                fp.write(f"test_time: {test_time}")
+            console.print(f"> Saved timing to {timing_path}")
 
-        metrics_path = Path(metrics_out_fmt.format(targ="metrics")).with_suffix(".json")
-    
-        # write metrics
-        with open(metrics_path, "w+") as jfp:
-            
-            json.dump(prepare_metrics_for_json([metrics]), jfp)
+            # targets / ids -----------------------------------------------
+            np.save(fmt.format(targ=f"targets_{canonical}"), targets_algn)
+            np.save(fmt.format(targ="sample_ids"),           order_ids)
 
-        console.print(f"> Saved targets with shape {targets.shape} to {targets_path}")
-        console.print(f"> Saved targets with shape {preds.shape} to {preds_path}")
-        console.print(f"> Saved targets with shape {logits.shape} to {logits_path}")
-        console.print(f"> Saved miss_types with len {len(miss_types)} to {miss_types_path}")
+            # logits per mask ---------------------------------------------
+            for m, arr in aligned_logits.items():
+                np.save(fmt.format(targ=f"logits_{m}"), arr)
+                console.print(f"> Saved logits_{m}.npy  shape {arr.shape}")
 
-        console.display_validation_metrics(metrics)
+            # metrics ------------------------------------------------------
+            metrics_path = Path(fmt.format(targ="metrics")).with_suffix(".json")
+            with open(metrics_path, "w") as fp:
+                json.dump(prepare_metrics_for_json([metrics]), fp)
+
+            console.display_validation_metrics(metrics)
 
     return experiment_data["metrics_history"]
-
-
-def main_cross_validation(config: StandardMultimodalConfig) -> Tuple[Module, Dict[str, Any], Path]:
-    """
-    Perform cross-validation training and evaluation.
-
-    Args:
-        config (StandardMultimodalConfig): Experiment configuration.
-
-    Returns:
-        Tuple[Module, Dict[str, Any], Path]: Trained model, experiment data, and output directory.
-    """
-    n_folds = config.experiment.cross_validation
-    fold_metrics = {}
-
-    console.start_task("Cross-Validation", total=n_folds)
-
-    models_output_path = Path(config.logging.model_output_path)
-
-    for fold_index in range(1, n_folds + 1):
-        console.print(f"\n[bold cyan]Starting Fold {fold_index}/{n_folds}[/]")
-        logger.info(f"Starting Fold {fold_index}/{n_folds}")
-
-        # Update paths for the fold
-        fold_output_dir = models_output_path / f"fold_{fold_index}"
-        fold_output_dir.mkdir(parents=True, exist_ok=True)
-        config.logging.model_output_path = str(fold_output_dir)
-
-        # Clean old checkpoints for this fold
-        logger.debug("Cleaning up old checkpoints...")
-        clean_checkpoints(
-            fold_output_dir
-        )
-
-        for dataset_config in config.data.datasets.values():
-            dataset_config.kwargs["cv_no"] = fold_index
-
-        # Prepare fold-specific components
-        dataloaders = setup_dataloaders(config)
-        console.print(f"Finished building dataloaders for split {fold_index}.")
-        model, optimizer, loss_functions, scheduler, device, metric_recorder = setup_model_components(
-            config=config, dataloaders=dataloaders
-        )
-        checkpoint_manager, experiment_data, report_generator, monitor = setup_tracking(
-            config=config, output_dir=fold_output_dir, model=model
-        )
-
-        # Add model information to experiment data
-        experiment_data["model_info"]["architecture"] = str(model)
-        experiment_data["model_info"]["parameters"] = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        experiment_data["model_info"]["size"] = (
-            sum(p.numel() for p in model.parameters()) * PARAMETER_SIZE_BYTES / 1024 / 1024
-        )  # in MB
-        if config.experiment.dry_run:
-            console.print("[yellow]Dry run completed for fold. Exiting.[/]")
-            return model, experiment_data, fold_output_dir
-        logger.info(gpu_memory)
-
-        try:
-            # Train and validate (only if is_train is enabled)
-            if config.experiment.is_train:
-                _ = _train_loop(
-                    config=config,
-                    model=model,
-                    dataloaders=dataloaders,
-                    optimizer=optimizer,
-                    loss_functions=loss_functions,
-                    device=device,
-                    metric_recorder=metric_recorder,
-                    checkpoint_manager=checkpoint_manager,
-                    scheduler=scheduler,
-                    experiment_data=experiment_data,
-                    monitor=monitor,
-                    checkpoint_mode="minimize" if config.logging.save_metric == "loss" else "maximize",
-                )
-
-            # Test (only if is_test is enabled)
-            if config.experiment.is_test:
-                test_metrics = test(
-                    model=model,
-                    dataloaders=dataloaders,
-                    loss_functions=loss_functions,
-                    device=device,
-                    metric_recorder=metric_recorder,
-                    checkpoint_manager=checkpoint_manager,
-                    experiment_data=experiment_data,
-                    monitor=monitor,
-                    metrics_out_fmt=config.logging.metrics_path / f"fold_{fold_index}" / "test_{targ}.npy",
-                )
-                fold_metrics[fold_index] = test_metrics
-
-                # Process embeddings if available
-                if hasattr(model, "get_embeddings") and "embeddings" in dataloaders:
-                    console.print("[bold cyan]Generating embeddings for visualization...[/]")
-                    embeddings = model.get_embeddings(dataloaders["embeddings"], device=device)
-
-                    fold_embeddings_dir = config.logging.metrics_path / f"fold_{fold_index}" / "embeddings"
-
-                    if embeddings is not None and isinstance(embeddings, dict):
-                        for modality, embds in embeddings.items():
-                            if not isinstance(modality, str) and isinstance(embds, list):
-                                embds = np.concatenate(embds, axis=0)
-                                console.print(f"Embeddings shape: {embds.shape}")
-
-                            if isinstance(modality, str):
-                                ## We're dealing with labels
-                                save_fp = fold_embeddings_dir / "labels.npy"
-                            else:
-                                save_fp = fold_embeddings_dir / f"{modality}_embeddings.npy"
-                            os.makedirs(save_fp.parent, exist_ok=True)
-                            try:
-                                np.save(save_fp, embds)
-                            except Exception as e:
-                                console.print(f"[bold red]Error saving embeddings: {e}[/]")
-                                console.print(f"Embeddings shape: {len(embds)}")
-                                raise e
-                            console.print(f"[green]✓[/] Saved {modality} embeddings to: {save_fp}")
-                    elif embeddings is not None and isinstance(embeddings, tuple):
-                        embeddings, reconstructions = embeddings
-                        for modality, embd in embeddings.items():
-                            embeddings_save_fp = fold_embeddings_dir / f"{modality}_embeddings.npy"
-                            os.makedirs(embeddings_save_fp.parent, exist_ok=True)
-                            np.save(embeddings_save_fp, embd)
-                            console.print(f"[green]✓[/] Saved embeddings to: {embeddings_save_fp}")
-
-                        for modality, recon in reconstructions.items():
-                            reconstructions_save_fp = fold_embeddings_dir / f"{modality}_reconstructions.npy"
-                            os.makedirs(reconstructions_save_fp.parent, exist_ok=True)
-                            np.save(reconstructions_save_fp, recon)
-                            console.print(f"[green]✓[/] Saved reconstructions to: {reconstructions_save_fp}")
-                else:
-                    console.print("[bold yellow]![/] Model / Data configuration does not support gathering embeddings")
-
-        finally:
-            if monitor:
-                monitor.close()
-                model.detach_monitor()
-
-        console.update_task("Cross-Validation", advance=1)
-
-    console.complete_task("Cross-Validation")
-
-    # Aggregate and save metrics
-    _train_metrics = []
-    _val_metrics = []
-    _test_metrics = []
-
-    for fold in fold_metrics:
-        ## Basically, the train and validation is just a list of metric dicts for each epoch of training.
-        train_metrics: List[Dict[str, Any]] = fold_metrics[fold]["train"]
-        val_metrics: List[Dict[str, Any]] = fold_metrics[fold]["validation"]
-
-        ## The test metrics is a single dict with the metrics for the test split.
-        test_metrics: Dict[str, Any] = fold_metrics[fold]["test"]
-
-        ## Need to both save the metrics per fold and also aggregate them for the final report.
-
-        train_output_path = config.logging.metrics_path / f"fold_{fold}" / "train_metrics.json"
-        val_output_path = config.logging.metrics_path / f"fold_{fold}" / "validation_metrics.json"
-        test_output_path = config.logging.metrics_path / f"fold_{fold}" / "test_metrics.json"
-
-        ## TODO Move this functionality elsewhere. I don't think it belongs in the main code.
-
-        os.makedirs(train_output_path.parent, exist_ok=True)
-        os.makedirs(val_output_path.parent, exist_ok=True)
-        os.makedirs(test_output_path.parent, exist_ok=True)
-
-        with open(train_output_path, "w") as f:
-            json.dump(prepare_metrics_for_json(train_metrics), f, indent=4)
-
-        with open(val_output_path, "w") as f:
-            json.dump(prepare_metrics_for_json(val_metrics), f, indent=4)
-
-        with open(test_output_path, "w") as f:
-            json.dump(prepare_metrics_for_json([test_metrics]), f, indent=4)
-
-        _train_metrics.append(train_metrics)
-        _val_metrics.append(val_metrics)
-        _test_metrics.append(test_metrics)
-
-    ## Aggregate metrics for final report
-    ## TODO Move this functionality elsewhere. I don't think it belongs in the main code.
-
-    def aggregate_cv_metrics(fold_metrics: List[List[Dict[str, Any]]] | List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """
-        Aggregate metrics across CV folds by averaging per epoch.
-
-        Args:
-            fold_metrics: List of metrics per fold, where each fold contains a list of metric dicts per epoch
-
-        Returns:
-            List of dicts containing averaged metrics per epoch
-        """
-        # Handle single-epoch test metrics
-        if isinstance(fold_metrics[0], dict):
-            fold_metrics = [[m] for m in fold_metrics]
-
-        # Validate all folds have same number of epochs
-        n_epochs = len(fold_metrics[0])
-        if not all(len(fold) == n_epochs for fold in fold_metrics):
-            raise ValueError("All folds must have the same number of epochs")
-
-        # Validate all epochs have the same metric keys across folds
-        metric_keys = set(fold_metrics[0][0].keys())
-        for fold in fold_metrics:
-            for epoch_metrics in fold:
-                if set(epoch_metrics.keys()) != metric_keys:
-                    raise ValueError("All epochs must have the same metric keys")
-
-        # Initialize storage for aggregated metrics
-        aggregated_metrics = []
-
-        # For each epoch
-        for epoch in range(n_epochs):
-            epoch_metrics = defaultdict(list)
-
-            # Collect metrics from each fold for this epoch
-            for fold in fold_metrics:
-                for metric_name, value in fold[epoch].items():
-                    # Skip non-numeric values
-                    if isinstance(value, (int, float)):
-                        epoch_metrics[metric_name].append(value)
-
-            # Average metrics across folds
-            averaged_metrics = {metric_name: float(np.mean(values)) for metric_name, values in epoch_metrics.items()}
-
-            aggregated_metrics.append(averaged_metrics)
-
-        return aggregated_metrics
-
-    train_metrics = aggregate_cv_metrics(_train_metrics)
-    val_metrics = aggregate_cv_metrics(_val_metrics)
-    test_metrics = aggregate_cv_metrics(_test_metrics)
-
-    train_output_path = config.logging.metrics_path / "train_metrics_agg.json"
-    val_output_path = config.logging.metrics_path / "validation_metrics_agg.json"
-    test_output_path = config.logging.metrics_path / "test_metrics_agg.json"
-
-    with open(train_output_path, "w") as f:
-        json.dump(prepare_metrics_for_json(train_metrics), f, indent=4)
-    console.print(f"[green]✓[/] Saved aggregated train metrics to: {train_output_path}")
-
-    with open(val_output_path, "w") as f:
-        json.dump(prepare_metrics_for_json(val_metrics), f, indent=4)
-    console.print(f"[green]✓[/] Saved aggregated validation metrics to: {val_output_path}")
-
-    with open(test_output_path, "w") as f:
-        json.dump(prepare_metrics_for_json(test_metrics), f, indent=4)
-    console.print(f"[green]✓[/] Saved aggregated test metrics to: {test_output_path}")
-
-    # Generate final report
-    report_path = report_generator.generate_report(experiment_data)
-    console.print(f"[green]Cross-validation experiment completed. Report saved at: {report_path}[/]")
-
-    return model, experiment_data, fold_output_dir
 
 
 def main(
@@ -928,6 +719,8 @@ def main(
     output_dir = Path(config.logging.log_path)
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    set_current_run_id(config.experiment.run_id)
+
     # Clean old checkpoints
     logger.debug("Cleaning up old checkpoints...")
     clean_checkpoints(os.path.join(os.path.dirname(config.logging.model_output_path), str(config.experiment.run_id)))
@@ -941,17 +734,31 @@ def main(
         config=config, output_dir=output_dir, model=model
     )
 
+    if config.model.pretrained_path:
+        console.print(f"[bold cyan]Loading pretrained model from {config.model.pretrained_path}[/]")
+        checkpoint_manager.load_checkpoint(model=model, load_best=False)
+        console.print(f"[green]✓[/] Loaded pretrained model from {config.model.pretrained_path}")
+    else:
+        console.print("[bold cyan]No pretrained model specified. Starting from scratch.[/]")
+        console.print("Starting from scratch.")
+    
+
     experiment_data["model_info"]["architecture"] = str(model)
     experiment_data["model_info"]["parameters"] = sum(p.numel() for p in model.parameters() if p.requires_grad)
     experiment_data["model_info"]["size"] = (
         sum(p.numel() for p in model.parameters()) * PARAMETER_SIZE_BYTES / 1024 / 1024
     )  # in MB
+
+    console.print(f"[bold green]Model Parameters:[/] [blue]{experiment_data['model_info']['parameters']:,}[/]")
+    console.print(count_parameters(model))
+
     if config.experiment.dry_run:
         console.print("[yellow]Dry run completed. Exiting.[/]")
         return model, experiment_data, output_dir
     logger.info(gpu_memory)
     try:
         # Training
+        console.print(f"\n[bold cyan] Is train: {config.experiment.is_train}[/]")
         if config.experiment.is_train:
             _train_loop(
                 config=config,
@@ -970,6 +777,8 @@ def main(
 
         # Testing
         if config.experiment.is_test:
+            checkpoint_manager.load_checkpoint(model=model, load_best=True)
+
             test(
                 model=model,
                 dataloaders=dataloaders,
@@ -984,44 +793,8 @@ def main(
 
             if hasattr(model, "get_embeddings") and "embeddings" in dataloaders:
                 console.print("[bold cyan]Generating embeddings for visualization...[/]")
-                embeddings = model.get_embeddings(dataloaders["embeddings"], device=device)
+                model.get_embeddings(dataloaders["embeddings"], trained_model=model, device=device,out_fp=config.logging.metrics_path / "embeddings.npy")
 
-                if embeddings is not None and isinstance(embeddings, dict):
-                    for modality, embds in embeddings.items():
-                        if not isinstance(modality, str) and isinstance(embds, list):
-                            embds = np.concatenate(embds, axis=0)
-                            console.print(f"Embeddings shape: {embds.shape}")
-
-                        if isinstance(modality, str):
-                            ## We're dealing with labels
-                            save_fp = config.logging.metrics_path / "embeddings" / "labels.npy"
-                        else:
-                            save_fp = config.logging.metrics_path / "embeddings" / f"{modality}_embeddings.npy"
-                        os.makedirs(save_fp.parent, exist_ok=True)
-                        try:
-                            np.save(save_fp, embds)
-                        except Exception as e:
-                            console.print(f"[bold red]Error saving embeddings: {e}[/]")
-                            console.print(f"Embedings shape: {len(embds)}")
-                            raise e
-                        console.print(f"[green]✓[/] Saved {modality} embeddings to: {save_fp}")
-                elif embeddings is not None and isinstance(embeddings, tuple):
-                    embeddings, reconstructions = embeddings
-                    for modality, embeddings in embeddings.items():
-                        embeddings_save_fp = config.logging.metrics_path / "embeddings" / f"{modality}_embeddings.npy"
-                        os.makedirs(embeddings_save_fp.parent, exist_ok=True)
-                        np.save(embeddings_save_fp, embeddings)
-                        console.print(f"[green]✓[/] Saved embeddings to: {embeddings_save_fp}")
-
-                    for modality, reconstructions in reconstructions.items():
-                        reconstructions_save_fp = (
-                            config.logging.metrics_path / "embeddings" / f"{modality}_reconstructions.npy"
-                        )
-                        os.makedirs(reconstructions_save_fp.parent, exist_ok=True)
-                        np.save(reconstructions_save_fp, reconstructions)
-                        console.print(f"[green]✓[/] Saved reconstructions to: {reconstructions_save_fp}")
-            else:
-                console.print("[bold yellow]![/] Model / Data configuration does not support gathering embeddings")
 
     finally:
         if monitor:
@@ -1029,14 +802,14 @@ def main(
             model.detach_monitor()
 
     # Generate final report
-    report_path = report_generator.generate_report(experiment_data)
-    console.print(f"[green]Experiment completed. Report saved at: {report_path}[/]")
+    # report_path = report_generator.generate_report(experiment_data)
+    # console.print(f"[green]Experiment completed. Report saved at: {report_path}[/]")
 
     return model, experiment_data, output_dir
 
 
 if __name__ == "__main__":
-    parser = ArgumentParser(description="Train a multimodal model and evaluate using missing data imputation.")
+    parser = ArgumentParser(description="Train a multimodal model and evaluate using missing data.")
 
     parser.add_argument("--config", type=str, required=True, help="Path to the configuration file.")
     parser.add_argument("--run_id", type=int, default=-1, help="The run ID for this experiment.")
@@ -1045,10 +818,12 @@ if __name__ == "__main__":
     optional_args.add_argument("--dry-run", action="store_true", help="Run a dry run of the experiment.")
     optional_args.add_argument("--skip-train", action="store_true", help="Skip training phase.")
     optional_args.add_argument("--skip-test", action="store_true", help="Skip testing phase.")
+
     optional_args.add_argument(
         "--disable_monitoring", action="store_true", help="Disable monitoring of model weights and gradients."
     )
 
+    optional_args.add_argument("--append-folder", type=str, default= None, help="Append a folder to the end of the logs, metrics output paths.")
     args = parser.parse_args()
 
     # Setup experiment
@@ -1057,12 +832,23 @@ if __name__ == "__main__":
     config.experiment.is_train = not args.skip_train
     config.experiment.is_test = not args.skip_test
 
+    #  add an optional folder to the end of the logs, metrics, and model output paths
+    if args.append_folder:
+        config.logging.log_path = Path(os.path.join(config.logging.log_path, args.append_folder))
+        config.logging.metrics_path = Path(os.path.join(config.logging.metrics_path, args.append_folder))
+
+        ## create all the folders
+        os.makedirs(config.logging.log_path, exist_ok=True)
+        os.makedirs(config.logging.metrics_path, exist_ok=True)
+        logger.debug(f"Appending folder to paths: {args.append_folder}")
+
+
     if args.disable_monitoring:
         config.monitoring.enabled = False
 
-    if config.experiment.cross_validation:
-        main_cross_validation(config)
-    else:
-        main(config)
+    # if config.experiment.cross_validation:
+    #     main_cross_validation(config)
+    # else:
+    main(config)
 
     shutdown_cursor_reset_hook()

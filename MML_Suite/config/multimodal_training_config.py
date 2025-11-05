@@ -46,6 +46,8 @@ class TrainingConfig(BaseConfig):
     early_stopping: bool = False
     early_stopping_patience: int = 10
     early_stopping_min_delta: float = 0.001
+    early_stopping_metric: str = "loss"
+    save_metric: str = "loss"
 
     def __post_init__(self):
         """Validate training configuration."""
@@ -107,6 +109,56 @@ class TrainingConfig(BaseConfig):
         console.print(table)
 
 
+    def get_optimizer(self, model: torch.nn.Module | list[torch.nn.Module]) -> Optimizer:
+        """Create optimizer instance."""
+        try:
+            parameter_group_optimizer = ParameterGroupsOptimizer(self.optimizer)
+
+            all_params = {}
+            if isinstance(model, list):
+                for m in model:
+                    all_params.update(dict(m.named_parameters()))
+            else:
+                all_params.update(dict(model.named_parameters()))
+
+            optimizer = parameter_group_optimizer.get_optimizer(all_params)
+            logger.info(f"Created optimizer: {optimizer.__class__.__name__}")
+            return optimizer
+        except Exception as e:
+            error_msg = f"Error creating optimizer: {str(e)}"
+            logger.error(f"{error_msg}\n{traceback.format_exc()}")
+            raise
+    
+    def get_scheduler(self, optimizer: Any) -> Optional[LRScheduler]:
+        """Create scheduler instance."""
+        if not self.scheduler:
+            return None
+
+        try:
+            scheduler_class = resolve_scheduler(self.scheduler)
+
+            if self.scheduler == "lambda":
+                scheduler_args = self.scheduler_args.copy()
+                console.print(f"Scheduler args: {scheduler_args}")
+                scheduler = create_lambda_scheduler(optimizer, scheduler_args)
+                console.print(f"Created LambdaLR scheduler with args: {scheduler_args}")
+            else:
+                scheduler = scheduler_class(optimizer, **self.scheduler_args)
+
+            logger.info(f"Created scheduler: {scheduler.__class__.__name__}")
+            return scheduler
+
+        except Exception as e:
+            error_msg = f"Error creating scheduler: {str(e)}"
+            logger.error(f"{error_msg}\n{traceback.format_exc()}")
+            raise
+
+    def get_loss_function(self) -> LossFunctionGroup:
+        """Get loss functions."""
+        return self.loss_functions
+
+
+
 @dataclass
 class BaseExperimentConfig(ABC):
     """Abstract base class for experiment configurations."""
@@ -147,7 +199,13 @@ class BaseExperimentConfig(ABC):
         """Create optimizer instance."""
         try:
             parameter_group_optimizer = ParameterGroupsOptimizer(self.training.optimizer)
-            optimizer = parameter_group_optimizer.get_optimizer(model)
+            all_params = {}
+            if isinstance(model, list):
+                for m in model:
+                    all_params.update(dict(m.named_parameters()))
+            else:
+                all_params.update(dict(model.named_parameters()))
+            optimizer = parameter_group_optimizer.get_optimizer(all_params)
             logger.info(f"Created optimizer: {optimizer.__class__.__name__}")
             return optimizer
         except Exception as e:
@@ -165,8 +223,9 @@ class BaseExperimentConfig(ABC):
 
             if self.training.scheduler == "lambda":
                 scheduler_args = self.training.scheduler_args.copy()
-                print(f"Scheduler args: {scheduler_args}")
+                console.print(f"Scheduler args: {scheduler_args}")
                 scheduler = create_lambda_scheduler(optimizer, scheduler_args)
+                console.print(f"Created LambdaLR scheduler with args: {scheduler_args}")
             else:
                 scheduler = scheduler_class(optimizer, **self.training.scheduler_args)
 
@@ -188,35 +247,15 @@ def create_lambda_scheduler(optimizer, scheduler_args):
         scheduler_args: Dictionary containing scheduler arguments
     """
     # Extract all the arguments
-    lambda_lr = scheduler_args.pop("lr_lambda")
+    niter = scheduler_args.pop("niter", None)
+    niter_decay = scheduler_args.pop("niter_decay", None)
+    epoch_count = scheduler_args.pop("epoch_count", 0)
 
-    # Create a closure that captures all the necessary variables
-    def create_lambda_func(args):
-        # Create a copy of the variables in the local scope
-        local_vars = args.copy()
-
-        def lambda_function(epoch):
-            # Make all arguments available to the lambda function
-            for key, value in local_vars.items():
-                globals()[key] = value
-
-            # Evaluate the lambda expression
-            result = eval(lambda_lr, globals(), {"epoch": epoch})
-
-            # Clean up globals to prevent leaks
-            for key in local_vars:
-                if key in globals():
-                    del globals()[key]
-
-            return result
-
-        return lambda_function
-
-    # Create the scheduler with the properly scoped lambda function
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=create_lambda_func(scheduler_args))
-    console.print(f"Created LambdaLR scheduler with lambda function: {lambda_lr}")
+    def lmbda(epoch):
+        return 1.0 - max(0, epoch + epoch_count - niter) / float(niter_decay + 1)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lmbda)
+    console.print(f"Created LambdaLR scheduler with lambda function: {lmbda}")
     return scheduler
-
 
 @dataclass
 class StandardMultimodalConfig(BaseExperimentConfig):
@@ -283,6 +322,8 @@ class StandardMultimodalConfig(BaseExperimentConfig):
     @classmethod
     def load(cls, path: Union[str, Path, PathLike], run_id: int) -> "StandardMultimodalConfig":
         """Load and create configuration from YAML file."""
+        set_current_run_id(run_id)
+
         console.print(f"\nLoading configuration from: {path}")
         import os
 
@@ -295,8 +336,7 @@ class StandardMultimodalConfig(BaseExperimentConfig):
             # Create component configs
             experiment_config = data["experiment"]
             experiment_config["run_id"] = run_id
-
-            set_current_run_id(run_id)
+    
             set_current_exp_name(experiment_config["name"])
 
             data_config = data["data"]
@@ -314,7 +354,7 @@ class StandardMultimodalConfig(BaseExperimentConfig):
                     format_path_with_env(model_config.pretrained_path)
                 )
                 console.print(f"Pretrained Path: {model_config.pretrained_path}")
-                model_config.validate_config()
+                model_config.validate_config(run_id=run_id, is_cv=experiment_config.cross_validation is not None)
             training_config = TrainingConfig.from_dict(data["training"])
 
             metrics_config = MetricConfig.from_dict(data["metrics"])

@@ -206,11 +206,12 @@ class KineticsSounds(Module, MultimodalMonitoringMixin):
         self.eval()
 
         with torch.no_grad():
-            A, V, labels, miss_type = (
+            A, V, labels, miss_type, sample_ids = (
                 batch[Modality.AUDIO].to(device).float(),
                 batch[Modality.VIDEO].to(device).float(),
                 batch["labels"].to(device),
                 batch["pattern_name"],
+                batch["sample_idx"],
             )
 
             logits = self.forward(A, V)
@@ -229,6 +230,7 @@ class KineticsSounds(Module, MultimodalMonitoringMixin):
             "targets": labels,
             "logits": safe_detach(logits),
             "miss_type": miss_type,
+            "sample_ids": sample_ids,
         }
 
     def get_embeddings(self, dataloader: DataLoader, device: torch.device) -> Dict[Modality, np.ndarray]:

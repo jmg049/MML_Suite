@@ -1,58 +1,30 @@
-[tool.poetry]
+[project]
 name = "mml-suite"
 version = "0.1.0"
-description = "MML_Suite is a modular tool for multimodal machine learning research. It supports configurable experiments, federated learning, and the novel C-MAMs approach for handling missing modalities."
-authors = ["Jack Geraghty (jmg049) <jgeraghty049@gmail.com>"]
-license = "MIT"
+description = "Add your description here"
 readme = "README.md"
-package-mode = false
+requires-python = ">=3.12"
+dependencies = [
+    "h5py>=3.14.0",
+    "matplotlib>=3.10.3",
+    "mm-datasets",
+    "modalities",
+    "numpy>=2.2.6",
+    "pandas>=2.3.0",
+    "pillow>=11.3.0",
+    "prettytable>=3.16.0",
+    "pyyaml>=6.0.2",
+    "rich>=14.0.0",
+    "scikit-learn>=1.7.0",
+    "seaborn>=0.13.2",
+    "tabulate>=0.9.0",
+    "torch>=2.7.1",
+    "torchaudio>=2.7.1",
+    "torchvision>=0.22.1",
+    "tqdm>=4.67.1",
+    "transformers>=4.53.1",
+]
 
-[tool.poetry.dependencies]
-python = ">=3.10"
-torch = "^2.5.0"
-modalities = {git = "https://github.com/jmg049/Modalities.git"}
-pyyaml = "^6.0.2"
-rich = "^13.9.3"
-numpy = "^2.1.2"
-pandas = "^2.2.3"
-tabulate = "^0.9.0"
-pillow = "^11.0.0"
-matplotlib = "^3.9.2"
-seaborn = "^0.13.2"
-torchvision = "^0.20.0"
-scikit-learn = "^1.5.2"
-ruff = "^0.7.1"
-h5py = "^3.12.1"
-transformers = "^4.46.1"
-mm-datasets = {git = "https://github.com/jmg049/DataSets.git"}
-joblib = "^1.4.2"
-pip = "^24.3.1"
-ipykernel = "^6.29.5"
-ipyfilechooser = "^0.6.0"
-statsmodels = "^0.14.4"
-sphinx = "^8.1.3"
-sphinx-rtd-theme = "^3.0.2"
-tensorboard = "^2.18.0"
-opencv-python = "^4.10.0.84"
-opencv-contrib-python = "^4.10.0.84"
-mypy = "^1.13.0"
-umap = "^0.1.1"
-pytorch-warmup = "^0.2.0"
-torch-geometric = "^2.6.1"
-pot = "^0.9.5"
-ipympl = "^0.9.6"
-pyqt6 = "^6.8.1"
-
-
-
-[build-system]
-requires = ["poetry-core"]
-build-backend = "poetry.core.masonry.api"
-
-
-[tool.ruff]
-lint.select = ["E", "F", "I", "N"]  # Add rule categories for Errors, Flake8 style, Imports, Naming conventions.
-lint.ignore = ["I001", "N806", "N803", "E501", "N812", "N802", "N999", "N801", "E741", "N811", "F811"]
-# Additional settings
-line-length = 120                # Max line length (often set to 88 or 120 in Python projects).
-exclude = ["build", "dist", ".venv"]  # Ignore virtual environments or specific directories.
+[tool.uv.sources]
+mm-datasets = { git = "https://github.com/jmg049/DataSets.git" }
+modalities = { git = "https://github.com/jmg049/Modalities.git" }

@@ -1,0 +1,277 @@
+!StandardConfig
+experiment: !ExperimentConfig
+  name: "MMIN MSP-IMPROV 8"
+  device: "cuda"
+  train_print_interval_epochs: 1
+  validation_print_interval_epochs: 1
+  is_train: true
+  is_test: true
+
+model: !ModelConfig
+  name: "MMIN"
+  model_type: "MMIN"
+
+  netA: !LSTMEncoder
+    input_size: 130
+    hidden_size: 128
+    embd_method: "maxpool"
+
+  netV: !LSTMEncoder
+    input_size: 342
+    hidden_size: 128
+    embd_method: "maxpool"
+
+  netT: !TextCNN
+    input_size: 1024
+    dropout: 0.3
+    in_channels: 1
+    out_channels: 128
+    kernel_heights: 
+      - 3
+      - 4
+      - 5
+  netC: !FcClassifier
+    input_dim: 320
+    layers: 
+      - 128
+      - 128
+    output_dim: 4
+    dropout: 0.5
+    use_bn: true
+  netAE: !ResidualAE
+    layers: [256, 128, 64]
+    n_blocks: 5
+    input_dim: 384
+    dropout: 0.0
+    use_bn: false
+  clip: 0.5
+  cycle_weight: 0.5
+  mse_weight: 2.0
+  ce_weight: 1.0
+
+  teacher_fusion_model: !UttFusionModel
+    pretrained_path: "$EXP_PATH/wch1/UTT_FUSION_MSP_IMPROV_8/models/{run_id}/best.pth"
+    netA: !LSTMEncoder
+      input_size: 130
+      hidden_size: 128
+      embd_method: "maxpool"
+
+    netV: !LSTMEncoder
+      input_size: 342
+      hidden_size: 128
+      embd_method: "maxpool"
+
+    netT: !TextCNN
+      input_size: 1024
+      dropout: 0.3
+      in_channels: 1
+      out_channels: 128
+      kernel_heights: 
+        - 3
+        - 4
+        - 5
+    netC: !FcClassifier
+      input_dim: 384
+      layers: 
+        - 128
+        - 128
+      output_dim: 4
+      dropout: 0.5
+      use_bn: true
+
+training:
+  epochs: 40
+  batch_size: 128
+  early_stopping: false
+  early_stopping_patience: 15
+  early_stopping_metric: "loss"
+  num_modalities: 3
+  optimizer: !Optimizer
+    name: "Adam"
+    default_kwargs:
+      lr: 5e-4
+      weight_decay: 0.00001
+  loss_functions: !LossFunctionGroup
+    cross_entropy: 
+      loss_name: "cross_entropy"
+      loss_args: {}
+      weight: 1.0
+  
+data: !DataConfig
+  use_collate_fn: true
+  datasets:
+    train: !DatasetConfig
+      batch_size: 128
+      cv_no: 8
+      dataset: "msp_improv"
+      data_fp: "$DATA/msp_improv/"
+      split: "train"
+      target_modality: !Modality "MULTIMODAL"
+      shuffle: true
+      drop_last: true
+      missing_patterns: !MissingPatternConfig
+        modalities:
+          !Modality audio: !ModalityConfig
+            missing_rate: 0.0  # Audio is ALWAYS present when included in pattern
+          !Modality video: !ModalityConfig
+            missing_rate: 0.0  # Video is ALWAYS present when included in pattern
+          !Modality text: !ModalityConfig 
+            missing_rate: 0.0  # Text is ALWAYS present when included in pattern
+        selected_patterns: ["avt", "a", "v", "t", "av", "at", "vt"]  # Only use these combinations of modalities
+      kwargs:
+        labels_key: "classification_labels"
+    validation: !DatasetConfig
+      batch_size: 128
+      cv_no: 8
+      dataset: "msp_improv"
+      data_fp: "$DATA/msp_improv"
+      split: "valid"
+      shuffle: true
+      drop_last: true
+      target_modality: !Modality "MULTIMODAL"
+      missing_patterns: !MissingPatternConfig
+        modalities:
+          !Modality audio: !ModalityConfig
+            missing_rate: 0.0  # Audio is ALWAYS present when included in pattern
+          !Modality video: !ModalityConfig
+            missing_rate: 0.0  # Video is ALWAYS present when included in pattern
+          !Modality text: !ModalityConfig 
+            missing_rate: 0.0  # Text is ALWAYS present when included in pattern
+        selected_patterns: ["avt", "a", "v", "t", "av", "at", "vt"]
+      kwargs:
+        labels_key: "classification_labels"
+
+    test: !DatasetConfig
+      batch_size: 128
+      cv_no: 8
+      dataset: "msp_improv"
+      data_fp: "$DATA/msp_improv"
+      split: "test"
+      target_modality: !Modality "MULTIMODAL"
+      shuffle: false
+      drop_last: true
+      missing_patterns: !MissingPatternConfig
+        modalities:
+          !Modality audio: !ModalityConfig
+            missing_rate: 0.0  # Audio is ALWAYS present when included in pattern
+          !Modality video: !ModalityConfig
+            missing_rate: 0.0  # Video is ALWAYS present when included in pattern
+          !Modality text: !ModalityConfig 
+            missing_rate: 0.0  # Text is ALWAYS present when included in pattern
+        selected_patterns: ["avt", "a", "v", "t", "av", "at", "vt"]
+      kwargs:
+        labels_key: "classification_labels"
+    embeddings: !DatasetConfig
+      batch_size: 128
+      cv_no: 8
+      dataset: "msp_improv"
+      data_fp: "$DATA/msp_improv"
+      split: "test"
+      target_modality: !Modality "MULTIMODAL"
+      shuffle: false
+      drop_last: true
+      missing_patterns: !MissingPatternConfig
+        modalities:
+          !Modality audio: !ModalityConfig
+            missing_rate: 0.0  # Audio is ALWAYS present when included in pattern
+          !Modality video: !ModalityConfig
+            missing_rate: 0.0  # Video is ALWAYS present when included in pattern
+          !Modality text: !ModalityConfig 
+            missing_rate: 0.0  # Text is ALWAYS present when included in pattern
+        selected_patterns: [ "a", "v", "t", "av", "at", "vt"]
+      kwargs:
+        labels_key: "classification_labels"
+
+metrics:
+  metrics:
+    Balanced_Accuracy:
+      function: "sklearn.metrics.balanced_accuracy_score"
+      kwargs: {}
+      level: "epoch"
+    Accuracy:
+      function: "sklearn.metrics.accuracy_score"
+      kwargs: {}
+      level: "epoch"
+    F1_Weighted:
+      function: "sklearn.metrics.f1_score"
+      kwargs: 
+        average: "weighted"
+        zero_division: 0
+      level: "epoch"    
+    F1_Micro:
+      function: "sklearn.metrics.f1_score"
+      kwargs: 
+        average: "micro"
+        zero_division: 0
+      level: "epoch"
+    F1_Macro:
+      function: "sklearn.metrics.f1_score"
+      kwargs:
+        average: "macro"
+        zero_division: 0
+      level: "epoch"
+    Precision_Weighted:
+      function: "sklearn.metrics.precision_score"
+      kwargs: 
+        average: "weighted"
+        zero_division: 0
+      level: "epoch"
+    Precision_Micro:
+      function: "sklearn.metrics.precision_score"
+      kwargs:
+        average: "micro"
+        zero_division: 0
+      level: "epoch"
+    Precision_Macro:
+      function: "sklearn.metrics.precision_score"
+      kwargs:
+        average: "macro"
+        zero_division: 0
+      level: "epoch"
+    Recall_Weighted:
+      function: "sklearn.metrics.recall_score"
+      kwargs: 
+        average: "weighted"
+        zero_division: 0
+      level: "epoch"
+    Recall_Micro:
+      function: "sklearn.metrics.recall_score"
+      kwargs: 
+        average: "micro"
+        zero_division: 0
+      level: "epoch"
+    Recall_Macro:
+      function: "sklearn.metrics.recall_score"
+      kwargs: 
+        average: "macro"
+        zero_division: 0
+      level: "epoch"
+    ConfusionMatrix:
+      function: "metrics.confusion_matrix_from_logits"
+      kwargs: {
+        "labels": [0, 1, 2, 3]
+      }
+      level: "epoch"
+  groups:
+    "classification": ["Balanced_Accuracy", "Accuracy", "F1_Weighted", "F1_Micro", "F1_Macro", "Precision_Weighted", "Precision_Micro", "Precision_Macro", "Recall_Weighted", "Recall_Micro", "Recall_Macro", "ConfusionMatrix"]
+
+logging:
+  log_path: "$EXP_PATH/wch3/{experiment_name}/logs/{run_id}/"
+  model_output_path: "$EXP_PATH/wch3/{experiment_name}/models/{run_id}"
+  metrics_path: "$EXP_PATH/wch3/{experiment_name}/metrics/{run_id}"
+  save_metric: "Recall_Macro_ATV"
+  monitor_path: "$EXP_PATH/wch3/{experiment_name}/monitoring/{run_id}"
+
+monitoring:
+  enabled: false
+  gradient_interval: 100
+  activation_interval: 100
+  weight_interval: 200
+  buffer_size: 1000
+  compression: "gzip"
+  compression_opts: 4
+  enable_gradient_tracking: true
+  enable_activation_tracking: true
+  enable_weight_tracking: true
+  enable_layer_convergence: true
+  enable_information_flow: false

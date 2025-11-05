@@ -7,7 +7,7 @@ import torch.nn.functional as F
 from experiment_utils.global_state import get_current_exp_name, get_current_run_id
 from experiment_utils.loss import LossFunctionGroup
 from experiment_utils.metric_recorder import MetricRecorder
-from experiment_utils.printing import get_console
+from experiment_utils.printing import get_console, print_info, print_warning
 from experiment_utils.utils import SafeDict, format_path_with_env, safe_detach
 from modalities import Modality
 from models.mixins import MultimodalMonitoringMixin
@@ -59,6 +59,7 @@ class UttFusionModel(Module, MultimodalMonitoringMixin, MultimodalModelProtocol)
         self.netC = netC
         self.clip = clip
         self.pretrained_path = pretrained_path
+        self.load_pretrained()
 
     def load_pretrained(self) -> None:
         """
@@ -70,13 +71,21 @@ class UttFusionModel(Module, MultimodalMonitoringMixin, MultimodalModelProtocol)
             self.pretrained_path = self.pretrained_path.format_map(
                 SafeDict(run_id=get_current_run_id(), exp_name=get_current_exp_name())
             )
-
             console.print(f"Loading pretrained weights from {self.pretrained_path}")
-            state_dict = torch.load(self.pretrained_path, map_location="cpu", weights_only=True)
-            self.load_state_dict(state_dict=state_dict["model_state_dict"])
+            state_dict = torch.load(self.pretrained_path, map_location="cpu", weights_only=True)["model_state_dict"]
+            netA_state_dict = {k.replace("netA.", ""): v for k, v in state_dict.items() if k.startswith("netA.")}
+            netV_state_dict = {k.replace("netV.", ""): v for k, v in state_dict.items() if k.startswith("netV.")}
+            netT_state_dict = {k.replace("netT.", ""): v for k, v in state_dict.items() if k.startswith("netT.")}
+
+            self.netA.load_state_dict(netA_state_dict)
+            self.netV.load_state_dict(netV_state_dict)
+            self.netT.load_state_dict(netT_state_dict)
+            console.print("[bold green] Pretrained weights loaded successfully.[/]")
+
+
         else:
             console.print("[bold red] WARNING: No pretrained weights loaded.[/]")
-            raise ValueError("No pretrained weights loaded.")
+            # raise ValueError("No pretrained weights loaded.")
 
     def get_encoder(self, modality: Modality | str) -> Module:
         """
@@ -103,6 +112,20 @@ class UttFusionModel(Module, MultimodalMonitoringMixin, MultimodalModelProtocol)
             case _:
                 raise ValueError(f"Unknown modality: {modality}")
 
+    def to(self, device):
+        """
+        Move the model to a specified device.
+
+        Args:
+            device: The target device (e.g., 'cpu' or 'cuda').
+        """
+        super().to(device)
+        self.netA.to(device)
+        self.netV.to(device)
+        self.netT.to(device)
+        self.netC.to(device)
+
+
     def forward(
         self,
         A: Optional[torch.Tensor] = None,
@@ -127,20 +150,12 @@ class UttFusionModel(Module, MultimodalMonitoringMixin, MultimodalModelProtocol)
         Returns:
             torch.Tensor: Prediction logits.
 
-        Raises:
-            AssertionError: If no input is provided or all inputs are pre-embedded.
         """
-        assert not all((A is None, V is None, T is None)), "At least one of A, V, T must be provided"
-        assert not all([is_embd_A, is_embd_V, is_embd_T]), "Cannot have all embeddings as True"
 
         a_embd = self.netA(A) if not is_embd_A and A is not None else A
         v_embd = self.netV(V) if not is_embd_V and V is not None else V
         t_embd = self.netT(T) if not is_embd_T and T is not None else T
-        #
-        # console.print(f"A Embd Shape: {a_embd.shape}")
-        # console.print(f"V Embd Shape: {v_embd.shape}")
-        # console.print("T Embd Shape: {t_embd.shape}")
-        #
+
         fused = torch.cat([embd for embd in [a_embd, v_embd, t_embd] if embd is not None], dim=-1)
         logits = self.netC(fused)
         return logits
@@ -179,12 +194,15 @@ class UttFusionModel(Module, MultimodalMonitoringMixin, MultimodalModelProtocol)
             batch[Modality.VIDEO].to(device).float(),
             batch[Modality.TEXT].to(device).float(),
             batch["label"].to(device),
-            batch["pattern_name"],
+            batch["pattern_names"],
         )
+
+        if labels.numel() == 0:
+            print_warning(console, "Empty labels encountered in training step.")
+            raise ValueError("Empty labels encountered in training step.")
 
         self.train()
         logits = self.forward(A, V, T)
-
         optimizer.zero_grad()
         loss = loss_functions(logits.squeeze(), labels.squeeze())["total_loss"]
         loss.backward()
@@ -195,10 +213,15 @@ class UttFusionModel(Module, MultimodalMonitoringMixin, MultimodalModelProtocol)
 
         predictions = safe_detach(F.softmax(logits, dim=-1).argmax(dim=-1).squeeze())
         labels = safe_detach(labels.squeeze())
-
-        metric_recorder.update_group_all(
-            "classification", predictions=predictions, targets=labels, m_types=np.array(_miss_type)
-        )
+        if metric_recorder is not None:
+            try:
+                metric_recorder.update_group_all(
+                "classification", predictions=predictions, targets=labels, m_types=np.array(_miss_type)
+            )
+            except Exception as e:
+                print_warning(console,f"Failed to update metric recorder: {e}")
+                print_warning(console, f"Predictions: {predictions}\nTargets: {labels}, m_types: {_miss_type}")
+                raise e
         return {"loss": loss.item()}
 
     def validation_step(
@@ -225,44 +248,75 @@ class UttFusionModel(Module, MultimodalMonitoringMixin, MultimodalModelProtocol)
         """
         self.eval()
 
-        all_predictions, all_labels, all_miss_types = [], [], []
+        all_predictions, all_labels, all_miss_types, all_sample_ids = [], [], [], []
+
 
         with torch.no_grad():
-            A, V, T, labels, miss_type = (
+            A, V, T, labels, miss_type, sample_ids = (
                 batch[Modality.AUDIO].to(device).float(),
                 batch[Modality.VIDEO].to(device).float(),
                 batch[Modality.TEXT].to(device).float(),
                 batch["label"].to(device),
-                batch["pattern_name"],
+                batch["pattern_names"],
+                batch["sample_idx"],
             )
+
+            ground_truth_embeddings = {
+                Modality.AUDIO: self.netA(A) if A is not None else None,
+                Modality.VIDEO: self.netV(V) if V is not None else None,
+                Modality.TEXT: self.netT(T) if T is not None else None,
+            }
+
 
             logits = self.forward(A, V, T)
 
             miss_types = np.array(miss_type)
 
-            loss = loss_functions(logits.squeeze(), labels)["total_loss"]
+
+            loss = loss_functions(logits.squeeze(), labels.squeeze())["total_loss"]
             predictions = safe_detach(F.softmax(logits, dim=-1).argmax(dim=-1).squeeze())
             labels = safe_detach(labels.squeeze())
 
-            metric_recorder.update_group_all(
-                "classification", predictions=predictions, targets=labels, m_types=miss_types
-            )
+            if metric_recorder is not None:
+                metric_recorder.update_group_all(
+                    "classification", predictions=predictions, targets=labels, m_types=miss_types
+                )
 
             if return_test_info:
-                all_predictions.append(predictions.cpu().numpy())
-                all_labels.append(labels.cpu().numpy())
+                all_predictions.append(predictions)
+                all_labels.append(labels)
                 all_miss_types.append(miss_type)
+                all_sample_ids.append(sample_ids)
 
         self.train()
 
         if return_test_info:
+            # Flatten the accumulated arrays for single batch processing
+            flat_sample_ids = []
+            flat_miss_types = []
+            for ids_batch in all_sample_ids:
+                if isinstance(ids_batch, (list, np.ndarray)):
+                    flat_sample_ids.extend(ids_batch)
+                else:
+                    flat_sample_ids.append(ids_batch)
+            for miss_batch in all_miss_types:
+                if isinstance(miss_batch, (list, np.ndarray)):
+                    flat_miss_types.extend(miss_batch)
+                else:
+                    flat_miss_types.append(miss_batch)
+
             return {
                 "loss": loss.item(),
                 "predictions": safe_detach(predictions),
                 "labels": labels,
-                "miss_type": miss_types,
+                "miss_type": flat_miss_types,
                 "targets": labels,
                 "logits": safe_detach(logits),
+                "sample_ids": flat_sample_ids,
+                "preds": safe_detach(predictions),  # For compatibility with older code
+                "ground_truth_logits": safe_detach(logits),  # For compatibility with older code
+                "ground_truth_embeddings": ground_truth_embeddings,
+
             }
         return {
             "loss": loss.item(),
@@ -271,37 +325,8 @@ class UttFusionModel(Module, MultimodalMonitoringMixin, MultimodalModelProtocol)
             "miss_type": miss_types,
             "targets": labels,
             "logits": safe_detach(logits),
+            "sample_ids": sample_ids,
+            "preds": safe_detach(predictions),  # For compatibility with older code
+            "ground_truth_logits": safe_detach(logits),  # For compatibility with older code
+            "ground_truth_embeddings": ground_truth_embeddings
         }
-
-    # def get_embeddings(self, dataloader: DataLoader, device: torch.device) -> Dict[Modality, np.ndarray]:
-    #     """
-    #     Get embeddings for all samples in a dataloader.
-
-    #     Args:
-    #         dataloader (DataLoader): DataLoader for the dataset.
-    #         device (torch.device): Computation device.
-
-    #     Returns:
-    #         Dict[Modality, np.ndarray]: Dictionary of embeddings for each modality.
-    #     """
-    #     self.eval()
-    #     embeddings = defaultdict(list)
-    #     with torch.no_grad():
-    #         for batch in dataloader:
-    #             A, V, T = (
-    #                 batch[Modality.AUDIO].to(device).float(),
-    #                 batch[Modality.VIDEO].to(device).float(),
-    #                 batch[Modality.TEXT].to(device).float(),
-    #             )
-    #             a_embd = self.netA(A)
-    #             v_embd = self.netV(V)
-    #             t_embd = self.netT(T)
-
-    #             for mod, embd in zip([Modality.AUDIO, Modality.VIDEO, Modality.TEXT], [a_embd, v_embd, t_embd]):
-    #                 if embd is not None:
-    #                     embeddings[mod].append(safe_detach(embd))
-    #             embeddings["label"] += batch["label"]
-
-    #     # embeddings: Dict[Modality, np.ndarray] = {mod: np.concatenate(embds) for mod, embds in embeddings.items()}
-
-    #     return embeddings

@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Literal, Optional
 
-from experiment_utils.utils import SafeDict
+from experiment_utils.utils import SafeDict, format_path_with_env
 from experiment_utils.printing import get_console
 from experiment_utils.logging import get_logger
 from rich.table import Table
@@ -33,7 +33,6 @@ class ModelConfig(BaseConfig):
     def __post_init__(self):
         """Initialize and validate the model configuration."""
         console.rule(f"[heading]Initializing Model Configuration: {self.name}[/]")
-
         self._display_config()
 
     def format_path(self, path: str, run_id: int) -> Path:
@@ -51,14 +50,15 @@ class ModelConfig(BaseConfig):
         console.print(f"[bold]Formatted Path:[/] {formatted_path}")
         return Path(formatted_path)
 
-    def validate_config(self, run_id: int) -> None:
+    def validate_config(self, run_id: int, is_cv: bool = False) -> None:
         """Validate the model configuration."""
         # Validate pretrained path
         if self.pretrained_path is not None:
             try:
                 path = self.format_path(str(self.pretrained_path), run_id)
+                path = format_path_with_env(str(path))
                 path = Path(path)
-                if not path.exists():
+                if not is_cv and not path.exists():
                     raise FileNotFoundError(f"Pretrained path not found: {path}")
                 console.print(f"[bold green]✓[/] Pretrained path verified: {path}")
                 self.pretrained_path = str(path.resolve())
@@ -106,7 +106,7 @@ class ModelConfig(BaseConfig):
         if self.kwargs:
             kwargs_table = Table(title="Additional Parameters", expand=True, title_style="bold white")
             kwargs_table.add_column("Parameter", style="cyan")
-            kwargs_table.add_column("Value", highlight=True)
+            kwargs_table.add_column("Value")
 
             for key, value in self.kwargs.items():
                 kwargs_table.add_row(str(key), str(value))

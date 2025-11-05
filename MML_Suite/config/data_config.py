@@ -2,6 +2,7 @@ from collections import OrderedDict
 from dataclasses import dataclass, field
 from itertools import chain, combinations
 from pathlib import Path
+import re
 import traceback
 from typing import Any, Dict, List, Optional, Set
 
@@ -115,15 +116,17 @@ class DatasetConfig(BaseConfig):
     data_fp: str
     target_modality: str
     split: str
-    batch_size: int = 32
+    batch_size: int
+    client_batch_size: Optional[int] = None
     shuffle: bool = False
     pin_memory: bool = False
     drop_last: bool = False
     num_workers: int = 0
     selected_missing_types: Optional[List[str]] = None
+    cv_no: Optional[int] = None
+    use_collate_fn: bool = False
     kwargs: Dict[str, Any] = field(default_factory=dict)
 
-    # New missing pattern configuration
     missing_patterns: Optional[MissingPatternConfig] = None
 
     def __post_init__(self):
@@ -141,6 +144,7 @@ class DatasetConfig(BaseConfig):
             "data_fp": self.data_fp,
             "split": self.split,
             "target_modality": self.target_modality,
+            "cv_no": self.cv_no,
         }
 
         # Add missing pattern configuration if available
@@ -160,11 +164,7 @@ class DatasetConfig(BaseConfig):
 
     def __str__(self) -> str:
         """Return a string representation of the configuration."""
-
         data_loader_str = "\n".join(f"{key}={getattr(self, key)}" for key in self.get_dataloader_args())
-
-        # dataset_str = "\n".join(f"{key}={getattr(self, key)}" for key, value in self.get_dataset_args().items())
-
         dataset_str = f"dataset={self.dataset}\ndata_fp={self.data_fp}\nsplit={self.split}\ntarget_modality={self.target_modality}"
         missing_str = f"missing_patterns={self.missing_patterns}" if self.missing_patterns else ""
 
@@ -199,8 +199,11 @@ class DatasetConfig(BaseConfig):
             "num_workers": self.num_workers,
             "pin_memory": self.pin_memory,
             "drop_last": self.drop_last,
+            "use_collate_fn": self.use_collate_fn,
         }
+
         logger.debug(f"DataLoader arguments: {args}")
+
         return args
 
     def build_dataset(self, batch_size: int) -> MultimodalBaseDataset:
@@ -211,10 +214,12 @@ class DatasetConfig(BaseConfig):
             dataset_init_args = str(signature(self._dataset_cls.__init__))
             if "batch_size" in dataset_init_args:
                 dataset_args["batch_size"] = batch_size
-
+            
+            dataset_args = dataset_args | self.kwargs
+            
             dataset = self._dataset_cls(**dataset_args)
             logger.info(f"Created {self._dataset_cls.__name__} dataset for {self.split} split")
-            console.print(f"[green]✓[/] Created dataset: {self._dataset_cls.__name__} ({len(dataset)} samples)")
+            console.print(f"[green]✓[/] Created dataset: {self._dataset_cls.__name__} ({len(dataset)} with missing) | ({len(dataset) /( len(dataset.selected_patterns) if not re.search("train|trn", dataset.split) else 1)} base number of samples.) ")
             return dataset
         except Exception as e:
             error_msg = f"Failed to create dataset: {traceback.format_exc()}"
@@ -281,8 +286,17 @@ class DataConfig(BaseConfig):
             # Build the dataset
             dataset = dataset_config.build_dataset(batch_size)
 
+            console.print(f"[blue]Use collate_fn: {self.use_collate_fn}[/]")
+            console.print(f"[blue]Has custom collate_fn: {hasattr(dataset, 'collate_fn')}[/]")
+
             if self.use_collate_fn and hasattr(dataset, "collate_fn"):
+                console.print(f"[yellow]Using custom collate_fn for {target_split} split[/]")
                 dataloader_args["collate_fn"] = dataset.collate_fn
+
+            try:
+                del dataloader_args["use_collate_fn"]
+            except KeyError:
+                pass
 
             # Create the DataLoader
             dataloader = DataLoader(dataset, **dataloader_args)
@@ -315,3 +329,15 @@ class DataConfig(BaseConfig):
                 logger.error(f"Failed to build DataLoader for {split}: {str(e)}")
                 raise e
         return dataloaders
+    
+
+    def build_all_datasets(self) -> Dict[str, MultimodalBaseDataset]:
+        """Build all datasets based on the configuration."""
+        datasets = {}
+        for name, config in self.datasets.items():
+            try:
+                datasets[name] = config.build_dataset(self.default_batch_size)
+            except Exception as e:
+                logger.error(f"Failed to build dataset for {name}: {str(e)}")
+                raise e
+        return datasets

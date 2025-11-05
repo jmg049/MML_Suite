@@ -26,8 +26,8 @@ class CMAMLoss(nn.Module):
         self,
         x_dims: int | list[int] = 0,
         z_dim: int = 0,
-        cosine_weight: float = 1.0,
-        mae_weight: float = 1.0,
+        cosine_weight: float = 0.0,
+        mae_weight: float = 0.0,
         mse_weight: float = 1.0,
         rec_weight: float = 1.0,
         cls_weight: float = 0.005,
@@ -39,6 +39,7 @@ class CMAMLoss(nn.Module):
         mmd_sigma: float = 1.0,
         maximize_cosine: bool = True,
         epsilon: float = 1e-8,
+        huber_weight: float = 0.0,
         cls_loss_type: Literal["ce", "bce", "mse"] = "ce",
         num_classes: Optional[int] = None,
     ):
@@ -65,6 +66,8 @@ class CMAMLoss(nn.Module):
             num_classes (Optional[int]): Number of classes for classification task.
         """
         super(CMAMLoss, self).__init__()
+
+
         self.cosine_weight = cosine_weight
         self.mae_weight = mae_weight
         self.mse_weight = mse_weight
@@ -79,7 +82,7 @@ class CMAMLoss(nn.Module):
         self.maximize_cosine = maximize_cosine
         self.epsilon = epsilon
         self.cls_loss_type = cls_loss_type
-
+        self.huber_weight = huber_weight
         self.cosine_similarity = nn.CosineSimilarity(dim=1, eps=epsilon)
         self.mae_loss = nn.L1Loss(reduction="mean")
         self.mse_loss = nn.MSELoss(reduction="mean")
@@ -97,6 +100,7 @@ class CMAMLoss(nn.Module):
                 self.cls_loss = nn.MSELoss()
             else:
                 raise ValueError(f"Unsupported classification loss type: {cls_loss_type}")
+        print(f"{self}")
 
     def __str__(self) -> str:
         return (
@@ -232,6 +236,8 @@ class CMAMLoss(nn.Module):
         Returns:
             Dict[str, torch.Tensor]: Dictionary containing total loss and individual loss components.
         """
+
+
         cosine_sim = self.cosine_similarity(predictions, targets).mean()
         # cosine_loss = -cosine_sim if self.maximize_cosine else cosine_sim
         cosine_loss = (1 - cosine_sim) * self.cosine_weight
@@ -247,6 +253,7 @@ class CMAMLoss(nn.Module):
         }
 
         if self.mmd_weight > 0:
+
             mmd = self.mmd_loss(predictions, targets)
             total_loss += self.mmd_weight * mmd
             loss_dict["mmd"] = mmd
@@ -271,9 +278,54 @@ class CMAMLoss(nn.Module):
             total_loss += self.cls_weight * cls_loss
             loss_dict["cls_loss"] = cls_loss
 
-        loss_dict["total_loss"] = total_loss
+        if self.huber_weight > 0:
+            huber_loss = self.huber_loss(predictions=predictions, targets=targets)
+            total_loss += self.huber_weight * huber_loss
+            loss_dict["huber"] = huber_loss
 
+        loss_dict["total_loss"] = total_loss
         return loss_dict
+    
+    def __str__(self) -> str:
+        """
+        Return a string representation of the CMAMLoss configuration.
+        
+        Returns:
+            str: A formatted string showing active loss components and their weights.
+        """
+        active_components = []
+        
+        # Check each weight and add to active components if non-zero
+        if self.mse_weight > 0:
+            active_components.append(f"MSE(w={self.mse_weight:.3f})")
+        
+        if self.mae_weight > 0:
+            active_components.append(f"MAE(w={self.mae_weight:.3f})")
+        
+        if self.cosine_weight > 0:
+            direction = "max" if self.maximize_cosine else "min"
+            active_components.append(f"Cosine(w={self.cosine_weight:.3f}, {direction})")
+        
+        if self.mmd_weight > 0:
+            active_components.append(f"MMD(w={self.mmd_weight:.3f}, σ={self.mmd_sigma:.1f})")
+        
+        if self.moment_weight > 0:
+            active_components.append(f"Moment(w={self.moment_weight:.3f}, n={self.num_moments})")
+        
+        if self.cyclic_weight > 0:
+            active_components.append(f"Cyclic(w={self.cyclic_weight:.3f})")
+        
+        if self.mi_weight > 0:
+            active_components.append(f"MI(w={self.mi_weight:.3f})")
+        
+        if self.cls_weight > 0:
+            active_components.append(f"Class(w={self.cls_weight:.3f}, {self.cls_loss_type})")
+        
+        # Join all active components with ' + '
+        loss_str = " + ".join(active_components) if active_components else "No active loss components"
+        
+        return f"CMAMLoss({loss_str})"
+    
 
     def to_latex(self) -> str:
         """
@@ -294,6 +346,7 @@ class CMAMLoss(nn.Module):
             ("cyclic_weight", "cyclic"),
             ("mi_weight", "MI"),
             ("cls_weight", "Cls"),
+            ("huber_weight", "Huber")
         ]
 
         # Define the mapping of loss term names to their specific inputs
@@ -306,6 +359,7 @@ class CMAMLoss(nn.Module):
             "cyclic": (r"\hat{f}", "f"),
             "MI": (r"\hat{f}", "f"),
             "Cls": (r"\hat{y}", "y"),
+            "Huber": (r"\hat{f}", "f")
         }
 
         for weight_attr, term_name in loss_terms:
@@ -324,3 +378,30 @@ class CMAMLoss(nn.Module):
         latex = r"\mathcal{L}_{\text{total}} = " + " + ".join(terms)
 
         return latex
+
+    def huber_loss(self, predictions: torch.Tensor, targets: torch.Tensor, delta: float = 1.0) -> torch.Tensor:
+        """
+        Compute Huber loss between predictions and targets.
+        
+        Args:
+            predictions (torch.Tensor): Predicted tensor.
+            targets (torch.Tensor): Target tensor.
+            delta (float): Threshold parameter for Huber loss.
+            
+        Returns:
+            torch.Tensor: Huber loss value.
+        """
+        # Calculate element-wise absolute difference
+        abs_diff = torch.abs(predictions - targets)
+        
+        # Apply quadratic part for small differences (< delta)
+        quadratic_part = torch.min(abs_diff, torch.tensor(delta)) ** 2 / 2
+        
+        # Apply linear part for large differences (>= delta)
+        linear_part = abs_diff - torch.tensor(delta) / 2
+        linear_part = torch.max(linear_part, torch.tensor(0.0))
+        
+        # Combine parts
+        loss = quadratic_part + linear_part
+        
+        return loss.mean()
